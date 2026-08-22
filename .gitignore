@@ -1,0 +1,10 @@
+build/
+logs/
+assets/
+lib/
+*.elf
+*.nacp
+*.nro
+*.map
+*.lst
+*.py
