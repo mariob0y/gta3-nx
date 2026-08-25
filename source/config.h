@@ -15,8 +15,8 @@
 #define MEMORY_SO_MB 64
 
 // Dynamic library names
-#define SO_NAME "libs/libGame.so"
-#define CXX_DONOR_SO_NAME "libs/libc++_shared.so"
+#define SO_NAME "lib/libGame.so"
+#define CXX_DONOR_SO_NAME "lib/libc++_shared.so"
 #define CONFIG_NAME "gta3_nx.cfg"
 #define LOG_NAME "gta3_log.txt"
 #define APPSTATE_NAME "appstate.txt"
@@ -35,6 +35,8 @@ typedef struct {
   int fps_cap_30;
   int log_mask;
   float streaming_budget_ms;
+  int show_fps_overlay;   // on-screen FPS/frame-time overlay (off by default)
+  int debug_log_enabled;  // write gta3_log.txt to disk (off by default)
 } Config;
 
 extern Config config;

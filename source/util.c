@@ -182,7 +182,7 @@ int debugPrintf(char *text, ...) {
 #ifdef DEBUG_LOG
   static int first_write = 1;
 
-  if (!s_log_file) {
+  if (!s_log_file && config.debug_log_enabled) {
     remove(LOG_NAME); // Explicitly delete old log file on every fresh boot
     s_log_file = fopen(LOG_NAME, "w");
     if (s_log_file) {

@@ -22,6 +22,8 @@ Config config = {
   .fps_cap_30 = 1,
   .log_mask = LOGC_SYS | LOGC_FILE | LOGC_THREAD,
   .streaming_budget_ms = 5.0f,
+  .show_fps_overlay = 0,
+  .debug_log_enabled = 0,
 };
 
 int read_config(const char *file) {
@@ -41,6 +43,8 @@ int read_config(const char *file) {
       else if (strcmp(key, "fps_cap_30") == 0) config.fps_cap_30 = atoi(val);
       else if (strcmp(key, "log_mask") == 0) config.log_mask = (int)strtoul(val, NULL, 0);
       else if (strcmp(key, "streaming_budget_ms") == 0) config.streaming_budget_ms = (float)atof(val);
+      else if (strcmp(key, "show_fps_overlay") == 0) config.show_fps_overlay = atoi(val);
+      else if (strcmp(key, "debug_log_enabled") == 0) config.debug_log_enabled = atoi(val);
     }
   }
 
@@ -64,6 +68,8 @@ int write_config(const char *file) {
   fprintf(f, "fps_cap_30=%d\n", config.fps_cap_30);
   fprintf(f, "log_mask=0x%x\n", config.log_mask);
   fprintf(f, "streaming_budget_ms=%.1f\n", config.streaming_budget_ms);
+  fprintf(f, "show_fps_overlay=%d\n", config.show_fps_overlay);
+  fprintf(f, "debug_log_enabled=%d\n", config.debug_log_enabled);
 
   fclose(f);
   debugPrintf("[CONFIG] Successfully saved config to %s\n", file);

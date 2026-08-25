@@ -333,7 +333,8 @@ unsigned int eglSwapBuffersHook(void *display, void *surface) {
                 dt_ms - stream_ms);
   }
 
-  draw_overlay(display, surface);
+  if (config.show_fps_overlay)
+    draw_overlay(display, surface);
 
   return eglSwapBuffers((EGLDisplay)display, (EGLSurface)surface);
 }

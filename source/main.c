@@ -80,19 +80,23 @@ static void check_data(void) {
   struct stat st;
   LOGC(LOGC_SYS, "[CHECK] Verifying data files and shared objects...\n");
 
-  if (stat("libs/libGame.so", &st) == 0)
+  if (stat("lib/libGame.so", &st) == 0)
+    s_game_so_path = "lib/libGame.so";
+  else if (stat("libs/libGame.so", &st) == 0)
     s_game_so_path = "libs/libGame.so";
   else if (stat("libGame.so", &st) == 0)
     s_game_so_path = "libGame.so";
   else
-    fatal_error("Could not find libGame.so.\nExtract libGame.so into /switch/gta3/libs/.");
+    fatal_error("Could not find libGame.so.\nExtract libGame.so into /switch/gta3/lib/.");
 
-  if (stat("libs/libc++_shared.so", &st) == 0)
+  if (stat("lib/libc++_shared.so", &st) == 0)
+    s_donor_so_path = "lib/libc++_shared.so";
+  else if (stat("libs/libc++_shared.so", &st) == 0)
     s_donor_so_path = "libs/libc++_shared.so";
   else if (stat("libc++_shared.so", &st) == 0)
     s_donor_so_path = "libc++_shared.so";
   else
-    fatal_error("Could not find libc++_shared.so.\nExtract libc++_shared.so into /switch/gta3/libs/.");
+    fatal_error("Could not find libc++_shared.so.\nExtract libc++_shared.so into /switch/gta3/lib/.");
 
   if (stat("assets", &st) < 0 && stat("assets/data", &st) < 0 && stat("assets/models", &st) < 0 &&
       stat("data", &st) < 0 && stat("models", &st) < 0 && stat("audio", &st) < 0)
