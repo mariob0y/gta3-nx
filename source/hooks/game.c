@@ -1957,293 +1957,96 @@ static bool perform_convert_and_account(char *buffer, int modelIndex) {
 
 /* ---------------- Switch controller input ----------------
  *
- * The game is the Android build and normally drives CPad from touch input
- * (CapturePad -> NewState, inside CPad::UpdatePads). This injects real
- * controller state after that runs, so a physical pad works without removing
- * touch: every field is only written when the controller actually supplies
- * input, leaving whatever CapturePad produced otherwise.
+ * Nothing here any more, and that is the point.
  *
- * Layout verified against libGame.so rather than taken from re3's header:
- *   CPad::GetPad(i)      (0x216914) = ms_Pads + i*252  -- smaddl w0,#0xfc
- *   CPad::GetPedWalkLeftRight (0x217e9c) reads ldrsh [x19,#0], [x19,#20], [x19,#22]
- *   CPad::GetPedWalkUpDown    (0x217d34) reads ldrsh [x19,#2], [x19,#16], [x19,#18]
- *   CPad::GetLookLeft         (0x218e44) reads ldrh  [x19,#10], [x19,#14]
- * confirming NewState sits at CPad offset 0 with re3's field order:
- *   0 LeftStickX   2 LeftStickY   4 RightStickX   6 RightStickY
- *   8 LShoulder1  10 LShoulder2  12 RShoulder1   14 RShoulder2
- *  16 DPadUp      18 DPadDown    20 DPadLeft     22 DPadRight
- *  24 Start       26 Select      28 Square       30 Triangle
- *  32 Cross       34 Circle      36 LeftShock    38 RightShock
- * Offsets 0,2,10,14,16,18,20,22 are directly confirmed by the disassembly
- * above; the rest follow the same contiguous int16 sequence and are the
- * first thing to re-check if a button misbehaves.
+ * This used to poke CPad::NewState directly from a CPad::UpdatePads hook and
+ * force seven CPad::MenuInput* predicates true, because the pad appeared dead:
+ * CapturePad only fills NewState from Touchscreen::SetupJoystate, and
+ * ToggleMenuJustDown ignores NewState entirely.
  *
- * Value ranges also come from the disassembly, not assumption:
- * GetPedWalkLeftRight's analog path does fcvtzs w8,s2,#7 (x128) before an
- * int16 safety clamp, so sticks are -128..127; the D-pad arm computes
- * (DPadRight - DPadLeft) >> 1 and is compared against the stick magnitude,
- * which only balances if the D-pad is 0/255. GetPedWalkUpDown computes
- * DPadDown - DPadUp, i.e. +Y is DOWN, so the Switch's +Y-up sticks invert. */
-#define CS_LEFTSTICKX   0
-#define CS_LEFTSTICKY   2
-#define CS_RIGHTSTICKX  4
-#define CS_RIGHTSTICKY  6
-#define CS_LSHOULDER1   8
-#define CS_LSHOULDER2  10
-#define CS_RSHOULDER1  12
-#define CS_RSHOULDER2  14
-#define CS_DPADUP      16
-#define CS_DPADDOWN    18
-#define CS_DPADLEFT    20
-#define CS_DPADRIGHT   22
-#define CS_START       24
-#define CS_SELECT      26
-#define CS_SQUARE      28
-#define CS_TRIANGLE    30
-#define CS_CROSS       32
-#define CS_CIRCLE      34
-#define CS_LEFTSHOCK   36
-#define CS_RIGHTSHOCK  38
+ * That was the wrong layer. The Android build has a complete gamepad stack of
+ * its own -- CHID / CHIDJoystickXbox360, fed by the GameNative gamepad entry
+ * points -- and CPad's getters consult it directly (CHID::IsPressed has 33
+ * callers, IsJustPressed 13, Implements 34, all of them CPad accessors). The
+ * only reason none of it ran is that CHID::CheckForInputChange (0x149198)
+ * refuses to construct a joystick instance until OS_GamepadIsConnected(0) is
+ * true, and the port was calling implOnGamepadConnected -- a symbol that
+ * exists in San Andreas but not in this binary -- so the connected flag was
+ * never set and CHID::GetInputType() stayed 0 (touchscreen) forever.
+ *
+ * main.c now reports the pad through implOnGamepadCountChanged, so the engine
+ * builds its own CHIDJoystickXbox360 on first input and every button works
+ * everywhere by the game's own routing, including the frontend and the icons.
+ * See the table in main.c for the button numbering and the icon consequences. */
 
-#define PAD_STICK_DEADZONE 4900 /* ~15% of the Switch's +-32767 range */
+/* ---- splash prompt ----------------------------------------------------------
+ *
+ * CMenuManager::DrawFrontEndNormal picks the splash caption straight off the
+ * input type (0x200ca8):
+ *     CText::Get(CHID::GetInputType() == 0 ? "SPLASH" : "SPLASH3")
+ * with SPLASH = "Tap To Continue" and SPLASH3 = "Press ::MENUOK:: To Continue."
+ * Both are replaced, so the caption never changes as you switch device.
+ * Touch never stops working -- the engine only swaps which affordance it names --
+ * so the prompt goes from telling you the truth to telling you half of it the
+ * moment you touch the pad.
+ *
+ * Overriding the lookup rather than editing the .gxt keeps the change in our
+ * source: the assets are the user's own extracted game data, a GXT edit would
+ * have to be repeated for all eight languages, and it would be silently undone
+ * by a re-extract. The cost is that this one string is now English regardless of
+ * the chosen language; every other string still comes from the GXT.
+ *
+ * ::MENUOK:: survives because the token is expanded later, by CFont::PrintString
+ * -> CHID::QueueHIDHelpIcon, which is what draws the A glyph from the button
+ * atlas. Our replacement carries the same token and so keeps the same icon. */
+typedef uint16_t *(*Func_CTextGet)(void *self, const char *key);
+static Func_CTextGet orig_CTextGet = NULL;
 
-/* Menu navigation. The menu predicates are hooked rather than driven through
- * CPad NewState fields, because not all of them read CPad at all:
- * CPad::ToggleMenuJustDown (0x2194ec) ignores NewState entirely and consults
- * CHID::IsJustPressed(42), falling back to
- * CControllerConfigManager::GetJoyButtonJustUp() == 12 -- so writing
- * NewState.Start could never open the pause menu no matter what it was set
- * to. Hooking the predicate and OR-ing our own edge state in is both simpler
- * and immune to however the CHID mapping happens to be configured. */
-#define MENU_REPEAT_DELAY_FRAMES 18
-#define MENU_REPEAT_RATE_FRAMES  6
-static uint64_t g_pad_prev_held = 0;
-static bool g_pad_plus_just = false;
-static bool g_pad_a_just = false;
-static bool g_pad_b_just = false;
-static bool g_menu_up_pulse = false;
-static bool g_menu_down_pulse = false;
-static int g_menu_stick_dir = 0;
-static int g_menu_stick_frames = 0;
+static uint16_t g_splash_prompt[64];
 
-/* NOTE: these are non-static C++ member functions, so they take `this`
- * in X0. The wrapper must accept it and forward it unchanged -- typing
- * them as (void) hands the original a garbage `this`, and it then reads
- * NewState off a bogus pointer, breaking touch input along with the pad. */
+static uint16_t *wrap_CTextGet(void *self, const char *key) {
+  /* Both keys, not just the pad one: the engine starts on SPLASH ("Tap To
+   * Continue") and only swaps to SPLASH3 once the input type changes, so
+   * overriding SPLASH3 alone still left the first screen naming touch only. */
+  if (key && key[0] == 'S' &&
+      (strcmp(key, "SPLASH") == 0 || strcmp(key, "SPLASH3") == 0) && g_splash_prompt[0])
+    return g_splash_prompt;
+  return orig_CTextGet ? orig_CTextGet(self, key) : NULL;
+}
+
+/* ---- menu auto-repeat -------------------------------------------------------
+ *
+ * These four predicates are the frontend's only navigation input
+ * (CMenuManager::ProcessButtonPresses calls each exactly once per tick), which
+ * is what makes hooking them the right scope: the repeat can never leak into
+ * gameplay, where the same d-pad and stick mean other things entirely -- the
+ * Xbox360 map also binds d-pad up/down to mappings 11 and 14, and the left stick
+ * to steering and movement.
+ *
+ * The original is always consulted first and its answer is never suppressed, so
+ * the initial press, the d-pad and touch all behave exactly as before; we only
+ * add the held-down repeat that the engine has no notion of. main.c owns the
+ * timing. */
+extern volatile int g_menu_repeat_up, g_menu_repeat_down;
+extern volatile int g_menu_repeat_left, g_menu_repeat_right;
+
 typedef bool (*Func_PadPredicate)(void *self);
-static Func_PadPredicate orig_ToggleMenuJustDown = NULL;
-static Func_PadPredicate orig_MenuInputUp = NULL;
-static Func_PadPredicate orig_MenuInputDown = NULL;
 static Func_PadPredicate orig_MenuInputUpJustDown = NULL;
 static Func_PadPredicate orig_MenuInputDownJustDown = NULL;
-static Func_PadPredicate orig_MenuInputAcceptJustDown = NULL;
-static Func_PadPredicate orig_MenuInputCancelJustDown = NULL;
+static Func_PadPredicate orig_MenuInputLeftJustDown = NULL;
+static Func_PadPredicate orig_MenuInputRightJustDown = NULL;
 
-/* Every menu predicate is hooked and reported as installed, yet the menu does
- * not respond to either the stick or A -- so the question is whether the menu
- * ever calls these at all. This logs the first call to each one (and the first
- * few thereafter), which distinguishes "our OR-in is wrong" from "this build's
- * frontend reads input somewhere else entirely and CPad is never consulted".
- * Rate-limited so a menu polled every frame cannot flood the log. */
-/* Logs the moment we force a predicate true. If these lines appear and the
- * menu still does not move, the menu is ignoring the return value and reads
- * input by another route; if they never appear, our latch is at fault. That
- * distinction is the whole point -- it is the difference between fixing the
- * input plumbing and fixing the wrong layer. */
-static void menu_inject_log(const char *name) {
-  LOGC(LOGC_SYS, "[PAD_PROBE] injected TRUE into %s (frame #%u)\n", name, g_frame_count);
-}
-
-static void menu_probe(const char *name) {
-  static const char *seen[16];
-  static int seen_n = 0;
-  for (int i = 0; i < seen_n; i++) {
-    if (seen[i] == name) return;
-  }
-  if (seen_n < 16) seen[seen_n++] = name;
-  LOGC(LOGC_SYS, "[PAD_PROBE] menu predicate called for the first time: %s (frame #%u)\n",
-       name, g_frame_count);
-}
-
-/* The three edge-triggered predicates consume their flag: each is sampled
- * once per press, and leaving the flag set would repeat the action for every
- * frame the button stayed down. The level-triggered nav pulses are already
- * one-frame events, so they are simply OR-ed. */
-static bool wrap_ToggleMenuJustDown(void *self) {
-  menu_probe("ToggleMenuJustDown");
-  bool base = orig_ToggleMenuJustDown ? orig_ToggleMenuJustDown(self) : false;
-  if (g_pad_plus_just) { g_pad_plus_just = false; menu_inject_log("ToggleMenuJustDown"); return true; }
-  return base;
-}
-static bool wrap_MenuInputUp(void *self) {
-  menu_probe("MenuInputUp");
-  bool base = orig_MenuInputUp ? orig_MenuInputUp(self) : false;
-  if (g_menu_up_pulse && !base) menu_inject_log("MenuInputUp");
-  return base || g_menu_up_pulse;
-}
-static bool wrap_MenuInputDown(void *self) {
-  menu_probe("MenuInputDown");
-  bool base = orig_MenuInputDown ? orig_MenuInputDown(self) : false;
-  if (g_menu_down_pulse && !base) menu_inject_log("MenuInputDown");
-  return base || g_menu_down_pulse;
-}
 static bool wrap_MenuInputUpJustDown(void *self) {
-  menu_probe("MenuInputUpJustDown");
-  bool base = orig_MenuInputUpJustDown ? orig_MenuInputUpJustDown(self) : false;
-  if (g_menu_up_pulse && !base) menu_inject_log("MenuInputUpJustDown");
-  return base || g_menu_up_pulse;
+  return (orig_MenuInputUpJustDown && orig_MenuInputUpJustDown(self)) || g_menu_repeat_up;
 }
 static bool wrap_MenuInputDownJustDown(void *self) {
-  menu_probe("MenuInputDownJustDown");
-  bool base = orig_MenuInputDownJustDown ? orig_MenuInputDownJustDown(self) : false;
-  if (g_menu_down_pulse && !base) menu_inject_log("MenuInputDownJustDown");
-  return base || g_menu_down_pulse;
+  return (orig_MenuInputDownJustDown && orig_MenuInputDownJustDown(self)) || g_menu_repeat_down;
 }
-static bool wrap_MenuInputAcceptJustDown(void *self) {
-  menu_probe("MenuInputAcceptJustDown");
-  bool base = orig_MenuInputAcceptJustDown ? orig_MenuInputAcceptJustDown(self) : false;
-  if (g_pad_a_just) { g_pad_a_just = false; menu_inject_log("MenuInputAcceptJustDown"); return true; }
-  return base;
+static bool wrap_MenuInputLeftJustDown(void *self) {
+  return (orig_MenuInputLeftJustDown && orig_MenuInputLeftJustDown(self)) || g_menu_repeat_left;
 }
-static bool wrap_MenuInputCancelJustDown(void *self) {
-  menu_probe("MenuInputCancelJustDown");
-  bool base = orig_MenuInputCancelJustDown ? orig_MenuInputCancelJustDown(self) : false;
-  if (g_pad_b_just) { g_pad_b_just = false; menu_inject_log("MenuInputCancelJustDown"); return true; }
-  return base;
-}
-
-typedef void (*Func_CPadUpdatePads)(void);
-static Func_CPadUpdatePads orig_CPadUpdatePads = NULL;
-typedef void *(*Func_CPadGetPad)(int);
-static Func_CPadGetPad real_CPadGetPad = NULL;
-
-static PadState g_nx_pad;
-static bool g_nx_pad_ready = false;
-static bool g_nx_pad_seen_input = false;
-
-static inline void cs_set_button(uint8_t *ns, int off, bool pressed) {
-  if (pressed) *(int16_t *)(ns + off) = 255; // leave touch's value alone otherwise
-}
-
-static inline void cs_set_stick(uint8_t *ns, int off, int32_t raw, bool invert) {
-  if (raw > -PAD_STICK_DEADZONE && raw < PAD_STICK_DEADZONE) return;
-  int32_t v = raw / 256; // +-32767 -> +-127
-  if (invert) v = -v;
-  if (v > 127) v = 127;
-  if (v < -127) v = -127;
-  *(int16_t *)(ns + off) = (int16_t)v;
-}
-
-static void wrap_CPadUpdatePads(void) {
-  if (orig_CPadUpdatePads) orig_CPadUpdatePads();
-  if (!real_CPadGetPad) return;
-
-  if (!g_nx_pad_ready) {
-    /* Deliberately no padConfigureInput here: main.c already called
-     * padConfigureInput(8, NpadStandard) at startup, and calling it again
-     * with a smaller count would quietly reduce the supported controller
-     * count out from under it. padInitializeAny matches main.c's own choice,
-     * so handheld and any paired controller both work. */
-    padInitializeAny(&g_nx_pad);
-    g_nx_pad_ready = true;
-  }
-  padUpdate(&g_nx_pad);
-
-  uint8_t *ns = (uint8_t *)real_CPadGetPad(0);
-  if (!ns) return;
-
-  {
-    static uint32_t last_log = 0;
-    if (g_frame_count - last_log >= 600) {
-      last_log = g_frame_count;
-      LOGC(LOGC_SYS, "[PAD_PROBE] CPad::UpdatePads still running (frame #%u)\n", g_frame_count);
-    }
-  }
-
-  uint64_t held = padGetButtons(&g_nx_pad);
-  HidAnalogStickState ls = padGetStickPos(&g_nx_pad, 0);
-  HidAnalogStickState rs = padGetStickPos(&g_nx_pad, 1);
-
-  if (!g_nx_pad_seen_input && (held || ls.x || ls.y || rs.x || rs.y)) {
-    g_nx_pad_seen_input = true;
-    LOGC(LOGC_SYS, "[PAD] Physical controller input detected (buttons=0x%llx)\n",
-         (unsigned long long)held);
-  }
-
-  /* A is Cross and B is Circle, rather than a positional mapping. The menu
-   * predicates decide this: MenuInputAcceptJustDown reads Cross (NewState+32,
-   * OldState+74) and MenuInputCancelJustDown reads Circle (+34, +76), so
-   * A-accepts / B-cancels -- the Nintendo convention -- only holds if A maps
-   * to Cross. In gameplay that puts accelerate on A and fire on B, with brake
-   * on Y and enter/exit on X. */
-  cs_set_button(ns, CS_CROSS,    (held & HidNpadButton_A) != 0);
-  cs_set_button(ns, CS_CIRCLE,   (held & HidNpadButton_B) != 0);
-  cs_set_button(ns, CS_SQUARE,   (held & HidNpadButton_Y) != 0);
-  cs_set_button(ns, CS_TRIANGLE, (held & HidNpadButton_X) != 0);
-
-  /* Edge and repeat state for the menu hooks below. A menu predicate is
-   * sampled once per menu tick, so a raw "stick is deflected" test would
-   * scroll uncontrollably; this turns a held stick into discrete pulses with
-   * the usual initial delay followed by a faster repeat. */
-  {
-    /* Latch presses from our own held-state edge rather than from
-     * padGetButtonsDown. The probe confirmed the menu predicates ARE called
-     * and UpdatePads keeps running, so the wiring is fine -- what is not safe
-     * is assuming this hook runs exactly once per input frame. A
-     * padGetButtonsDown transition is reported for one padUpdate only, so if
-     * UpdatePads runs twice in a frame, or the menu polls its predicate
-     * before this hook runs, the press is silently lost. A latch cannot miss:
-     * it is set on the press edge, survives until something consumes it, and
-     * is dropped on release if nothing ever did. */
-    uint64_t newly = held & ~g_pad_prev_held;
-    g_pad_prev_held = held;
-    if (newly & HidNpadButton_Plus) g_pad_plus_just = true;
-    if (newly & HidNpadButton_A)    g_pad_a_just = true;
-    if (newly & HidNpadButton_B)    g_pad_b_just = true;
-    if (!(held & HidNpadButton_Plus)) g_pad_plus_just = false;
-    if (!(held & HidNpadButton_A))    g_pad_a_just = false;
-    if (!(held & HidNpadButton_B))    g_pad_b_just = false;
-
-    int dir = 0;
-    if (ls.y > PAD_STICK_DEADZONE) dir = -1;       /* stick up   -> menu up   */
-    else if (ls.y < -PAD_STICK_DEADZONE) dir = 1;  /* stick down -> menu down */
-
-    if (dir != g_menu_stick_dir) {
-      g_menu_stick_dir = dir;
-      g_menu_stick_frames = 0;
-      g_menu_up_pulse = (dir < 0);
-      g_menu_down_pulse = (dir > 0);
-    } else if (dir != 0) {
-      g_menu_stick_frames++;
-      bool pulse = (g_menu_stick_frames > MENU_REPEAT_DELAY_FRAMES) &&
-                   ((g_menu_stick_frames % MENU_REPEAT_RATE_FRAMES) == 0);
-      g_menu_up_pulse = pulse && (dir < 0);
-      g_menu_down_pulse = pulse && (dir > 0);
-    } else {
-      g_menu_up_pulse = false;
-      g_menu_down_pulse = false;
-    }
-  }
-
-  cs_set_button(ns, CS_LSHOULDER1, (held & HidNpadButton_L) != 0);
-  cs_set_button(ns, CS_RSHOULDER1, (held & HidNpadButton_R) != 0);
-  cs_set_button(ns, CS_LSHOULDER2, (held & HidNpadButton_ZL) != 0);
-  cs_set_button(ns, CS_RSHOULDER2, (held & HidNpadButton_ZR) != 0);
-
-  cs_set_button(ns, CS_START,      (held & HidNpadButton_Plus) != 0);
-  cs_set_button(ns, CS_SELECT,     (held & HidNpadButton_Minus) != 0);
-  cs_set_button(ns, CS_LEFTSHOCK,  (held & HidNpadButton_StickL) != 0);
-  cs_set_button(ns, CS_RIGHTSHOCK, (held & HidNpadButton_StickR) != 0);
-
-  cs_set_button(ns, CS_DPADUP,    (held & HidNpadButton_Up) != 0);
-  cs_set_button(ns, CS_DPADDOWN,  (held & HidNpadButton_Down) != 0);
-  cs_set_button(ns, CS_DPADLEFT,  (held & HidNpadButton_Left) != 0);
-  cs_set_button(ns, CS_DPADRIGHT, (held & HidNpadButton_Right) != 0);
-
-  cs_set_stick(ns, CS_LEFTSTICKX,  ls.x, false);
-  cs_set_stick(ns, CS_LEFTSTICKY,  ls.y, true);
-  cs_set_stick(ns, CS_RIGHTSTICKX, rs.x, false);
-  cs_set_stick(ns, CS_RIGHTSTICKY, rs.y, true);
+static bool wrap_MenuInputRightJustDown(void *self) {
+  return (orig_MenuInputRightJustDown && orig_MenuInputRightJustDown(self)) || g_menu_repeat_right;
 }
 
 static bool wrap_ConvertBufferToObject(char *buffer, int modelIndex) {
@@ -3433,21 +3236,22 @@ void setup_subsystem_phase_hooks(void) {
     }
   }
 
-  real_CPadGetPad = (Func_CPadGetPad)so_try_find_addr_rx(&game_mod, "_ZN4CPad6GetPadEi");
-  uintptr_t updatepads_addr = so_try_find_addr_rx(&game_mod, "_ZN4CPad10UpdatePadsEv");
-  if (real_CPadGetPad && updatepads_addr) {
-    orig_CPadUpdatePads = (Func_CPadUpdatePads)hook_arm64_trampoline(updatepads_addr, (uintptr_t)wrap_CPadUpdatePads);
-    if (orig_CPadUpdatePads) {
-      installed_count++;
-      LOGC(LOGC_SYS, "[PAD] CPad::UpdatePads hooked at %p (GetPad=%p) -- Switch controller input active\n",
-           (void *)updatepads_addr, (void *)real_CPadGetPad);
-    } else {
-      LOGC(LOGC_SYS, "[PAD] REJECTED hook for CPad::UpdatePads at %p (unrelocatable prologue) -- touch only\n",
-           (void *)updatepads_addr);
+  {
+    /* GXT strings are UTF-16; widening an ASCII literal at runtime avoids
+     * depending on how the toolchain lays out a u"" literal, and the Latin
+     * range is identical in both. */
+    static const char kPrompt[] = "Tap Or Press ::MENUOK:: To Continue.";
+    for (size_t i = 0; i < sizeof(kPrompt) && i < sizeof(g_splash_prompt) / sizeof(g_splash_prompt[0]); i++)
+      g_splash_prompt[i] = (uint16_t)(unsigned char)kPrompt[i];
+
+    uintptr_t a = so_try_find_addr_rx(&game_mod, "_ZN5CText3GetEPKc");
+    if (a) {
+      orig_CTextGet = (Func_CTextGet)hook_arm64_trampoline(a, (uintptr_t)wrap_CTextGet);
+      if (orig_CTextGet) {
+        installed_count++;
+        LOGC(LOGC_SYS, "[PAD] CText::Get hooked at %p -- splash prompt names touch and pad\n", (void *)a);
+      }
     }
-  } else {
-    LOGC(LOGC_SYS, "[PAD] CPad symbols missing (GetPad=%p UpdatePads=%p) -- touch only\n",
-         (void *)real_CPadGetPad, (void *)updatepads_addr);
   }
 
   {
@@ -3456,29 +3260,25 @@ void setup_subsystem_phase_hooks(void) {
       Func_PadPredicate *orig;
       void *wrap;
       const char *what;
-    } kMenuHooks[] = {
-      { "_ZN4CPad18ToggleMenuJustDownEv",      &orig_ToggleMenuJustDown,      (void *)wrap_ToggleMenuJustDown,      "ToggleMenu(+)" },
-      { "_ZN4CPad11MenuInputUpEv",             &orig_MenuInputUp,             (void *)wrap_MenuInputUp,             "MenuUp" },
-      { "_ZN4CPad13MenuInputDownEv",           &orig_MenuInputDown,           (void *)wrap_MenuInputDown,           "MenuDown" },
-      { "_ZN4CPad19MenuInputUpJustDownEv",     &orig_MenuInputUpJustDown,     (void *)wrap_MenuInputUpJustDown,     "MenuUpJustDown" },
-      { "_ZN4CPad21MenuInputDownJustDownEv",   &orig_MenuInputDownJustDown,   (void *)wrap_MenuInputDownJustDown,   "MenuDownJustDown" },
-      { "_ZN4CPad23MenuInputAcceptJustDownEv", &orig_MenuInputAcceptJustDown, (void *)wrap_MenuInputAcceptJustDown, "MenuAccept(A)" },
-      { "_ZN4CPad23MenuInputCancelJustDownEv", &orig_MenuInputCancelJustDown, (void *)wrap_MenuInputCancelJustDown, "MenuCancel(B)" },
+    } kMenuRepeat[] = {
+      { "_ZN4CPad19MenuInputUpJustDownEv",    &orig_MenuInputUpJustDown,    (void *)wrap_MenuInputUpJustDown,    "MenuUp" },
+      { "_ZN4CPad21MenuInputDownJustDownEv",  &orig_MenuInputDownJustDown,  (void *)wrap_MenuInputDownJustDown,  "MenuDown" },
+      { "_ZN4CPad21MenuInputLeftJustDownEv",  &orig_MenuInputLeftJustDown,  (void *)wrap_MenuInputLeftJustDown,  "MenuLeft" },
+      { "_ZN4CPad22MenuInputRightJustDownEv", &orig_MenuInputRightJustDown, (void *)wrap_MenuInputRightJustDown, "MenuRight" },
     };
-    for (size_t i = 0; i < sizeof(kMenuHooks) / sizeof(kMenuHooks[0]); i++) {
-      uintptr_t a = so_try_find_addr_rx(&game_mod, kMenuHooks[i].sym);
+    for (size_t i = 0; i < sizeof(kMenuRepeat) / sizeof(kMenuRepeat[0]); i++) {
+      uintptr_t a = so_try_find_addr_rx(&game_mod, kMenuRepeat[i].sym);
       if (!a) {
-        LOGC(LOGC_SYS, "[PAD] %s symbol not found\n", kMenuHooks[i].what);
+        LOGC(LOGC_SYS, "[PAD] %s symbol not found -- no auto-repeat\n", kMenuRepeat[i].what);
         continue;
       }
-      *kMenuHooks[i].orig =
-          (Func_PadPredicate)hook_arm64_trampoline(a, (uintptr_t)kMenuHooks[i].wrap);
-      if (*kMenuHooks[i].orig) {
+      *kMenuRepeat[i].orig =
+          (Func_PadPredicate)hook_arm64_trampoline(a, (uintptr_t)kMenuRepeat[i].wrap);
+      if (*kMenuRepeat[i].orig) {
         installed_count++;
-        LOGC(LOGC_SYS, "[PAD] %s hooked at %p\n", kMenuHooks[i].what, (void *)a);
+        LOGC(LOGC_SYS, "[PAD] %s auto-repeat hooked at %p\n", kMenuRepeat[i].what, (void *)a);
       } else {
-        LOGC(LOGC_SYS, "[PAD] REJECTED hook for %s at %p (unrelocatable prologue)\n",
-             kMenuHooks[i].what, (void *)a);
+        LOGC(LOGC_SYS, "[PAD] REJECTED auto-repeat hook for %s at %p\n", kMenuRepeat[i].what, (void *)a);
       }
     }
   }

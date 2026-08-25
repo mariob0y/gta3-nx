@@ -33,8 +33,6 @@ so_module game_mod;  // libGame.so
 size_t g_mem_total_mb = 0, g_mem_newlib_mb = 0, g_mem_so_mb = 0;
 u32 __nx_nv_transfermem_size = 0x60000000; // 1.5 GB GPU memory pool
 
-volatile int g_escape_pressed = 0;
-volatile int g_select_pressed = 0;
 uint32_t g_frame_count = 0;
 
 void __libnx_initheap(void) {
@@ -128,18 +126,46 @@ static void set_screen_size(int w, int h) {
   debugPrintf("[SYS] Target screen mode: %dx%d\n", screen_width, screen_height);
 }
 
+/* ---------------------------------------------------------------------------
+ * Controller -> engine gamepad.
+ *
+ * libGame.so already contains a complete gamepad stack; it only ever sat idle
+ * because nothing told it a pad was attached. implOnGamepadButtonDown/Up write
+ * gamepads[pad].buttons[keycode] and queue a LIB_InputEvent, and every CPad
+ * getter (GetSteeringLeftRight, WeaponJustDown, MenuInput*, ToggleMenuJustDown,
+ * ...) reads that back through CHID::IsPressed / IsJustPressed. So the whole
+ * game -- gameplay, frontend, cutscene skips -- is driven from this one table.
+ *
+ * Button IDs are NOT raw keycodes; they are the engine's CHIDJoystick numbering,
+ * read out of CHIDJoystickXbox360's own default mapping table at 0x14a8dc:
+ *   CROSS=0 CIRCLE=1 SQUARE=2 TRIANGLE=3 START=4 SELECT=5 L1=6 R1=7
+ *   DPAD_UP=8 DPAD_DOWN=9 DPAD_LEFT=10 DPAD_RIGHT=11 L3=12 R3=13.
+ * implOnGamepadButtonDown (0x36e2d4) bounds-checks keycode < 32, but the state
+ * container behind it is a ButtonContainer<16>, so only 0..15 are real.
+ *
+ * L2/R2 have no button ID at all in this build -- the Xbox360 map reaches them
+ * only as axes 68/69, so ZL/ZR go through implOnGamepadAxesChanged instead.
+ *
+ * Face buttons are matched by LETTER, not by position. The engine draws its
+ * help icons from assets/es2/buttonsxbox360.png, and FindUVsFromMapping
+ * (0x14accc) indexes that atlas by button ID: 0->A, 1->B, 2->X, 3->Y. Mapping
+ * Switch A to CROSS therefore makes the on-screen glyph always name the button
+ * actually under the thumb, and lands confirm on A / cancel on B, which is the
+ * Nintendo convention. The cost is that the layout is rotated relative to the
+ * PS2 original (enter-vehicle sits on Y rather than the top button).
+ * --------------------------------------------------------------------------- */
 typedef struct {
   u64 hid;
   int button;
 } PadMap;
 
 static const PadMap pad_map[] = {
-  { HidNpadButton_B,       0 },  // CROSS / Confirm
-  { HidNpadButton_A,       1 },  // CIRCLE / Cancel
-  { HidNpadButton_Y,       2 },  // SQUARE / Action
-  { HidNpadButton_X,       3 },  // TRIANGLE / Enter vehicle
-  { HidNpadButton_Plus,    4 },  // START / Menu
-  { HidNpadButton_Minus,   5 },  // SELECT / Map
+  { HidNpadButton_A,       0 },  // CROSS    -- accelerate / confirm   (icon A)
+  { HidNpadButton_B,       1 },  // CIRCLE   -- fire / cancel          (icon B)
+  { HidNpadButton_X,       2 },  // SQUARE   -- brake                  (icon X)
+  { HidNpadButton_Y,       3 },  // TRIANGLE -- enter vehicle          (icon Y)
+  { HidNpadButton_Plus,    4 },  // START    -- pause menu
+  { HidNpadButton_Minus,   5 },  // SELECT   -- radar / map
   { HidNpadButton_L,       6 },  // L1
   { HidNpadButton_R,       7 },  // R1
   { HidNpadButton_Up,      8 },  // DPAD_UP
@@ -149,7 +175,6 @@ static const PadMap pad_map[] = {
   { HidNpadButton_StickL, 12 },  // L3
   { HidNpadButton_StickR, 13 },  // R3
 };
-
 static void (* implOnActivityCreated)(void *env, void *thiz, void *activity);
 static void (* implOnActivityDestroyed)(void *env, void *thiz);
 static void (* implOnInitialSetup)(void *env, void *thiz, void *activity, void *apk, void *names, void *paths);
@@ -167,7 +192,8 @@ Handle g_main_thread_handle = 0;
 static void (* implOnTouchStart)(void *env, void *thiz, int id, float x, float y);
 static void (* implOnTouchMove)(void *env, void *thiz, int id, float x, float y);
 static void (* implOnTouchEnd)(void *env, void *thiz, int id, float x, float y);
-static void (* implOnGamepadConnected)(void *env, void *thiz, int pad);
+static void (* implOnGamepadCountChanged)(void *env, void *thiz, int count);
+static int  (* CHID_GetInputType)(void);
 static void (* implOnGamepadButtonDown)(void *env, void *thiz, int pad, int keycode);
 static void (* implOnGamepadButtonUp)(void *env, void *thiz, int pad, int keycode);
 static void (* implOnGamepadAxesChanged)(void *env, void *thiz, int pad,
@@ -200,7 +226,8 @@ static void resolve_entry_points(void) {
   ENT(implOnTouchStart, "implOnTouchStart");
   ENT(implOnTouchMove, "implOnTouchMove");
   ENT(implOnTouchEnd, "implOnTouchEnd");
-  ENTOPT(implOnGamepadConnected, "implOnGamepadConnected");
+  ENTOPT(implOnGamepadCountChanged, "implOnGamepadCountChanged");
+  CHID_GetInputType = (void *)so_try_find_addr_rx(&game_mod, "_ZN4CHID12GetInputTypeEv");
   ENTOPT(implOnGamepadButtonDown, "implOnGamepadButtonDown");
   ENTOPT(implOnGamepadButtonUp, "implOnGamepadButtonUp");
   ENTOPT(implOnGamepadAxesChanged, "implOnGamepadAxesChanged");
@@ -322,8 +349,161 @@ static void open_cheat_keyboard(void) {
     cheats_enqueue(out);
 }
 
+/* CHID::CheckForInputChange (0x149198) will not build a CHIDJoystickXbox360 --
+ * and so will not switch the game off touch controls or onto pad icons --
+ * until OS_GamepadIsConnected(0) returns true. That flag lives in
+ * gamepads[0]+56 and the only thing that sets it is implOnGamepadCountChanged.
+ * The engine's own copy is edge-guarded, so calling it every frame would be
+ * harmless, but tracking the change ourselves keeps the log readable and makes
+ * hot-plug (Joy-Cons detached, docking, a Pro Controller paired mid-game)
+ * report exactly once. */
+static int pad_reported_count = -1;
+
+static void report_gamepad_count(int count) {
+  if (count == pad_reported_count || !implOnGamepadCountChanged)
+    return;
+  pad_reported_count = count;
+  /* thiz is unused by the entry point (it is a static JNI method and the
+   * disassembly never touches x1), so NULL matches the other input calls. */
+  implOnGamepadCountChanged(fake_env, NULL, count);
+  LOGC(LOGC_SYS, "[PAD] Reported %d gamepad(s) to the engine\n", count);
+}
+
+/* Whether any of this worked is a single observable: CHID::GetInputType()
+ * returns 0 while the active HID instance is the touchscreen (none), 1 once
+ * CheckForInputChange has built a CHIDJoystickXbox360, 2 for a keyboard. It is
+ * a plain read of m_pInstance[currentInstanceIndex] plus one vtable call, so
+ * polling it costs nothing and it is safe before the engine is up (a NULL
+ * instance reports 0). Logging the transition is what distinguishes "the pad
+ * is wired" from "the pad is wired and the engine agrees". */
+static int chid_input_type_last = -1;
+
+static void log_input_type_change(void) {
+  if (!CHID_GetInputType)
+    return;
+  const int t = CHID_GetInputType();
+  if (t == chid_input_type_last)
+    return;
+  chid_input_type_last = t;
+  static const char *kNames[] = { "touchscreen", "joystick", "keyboard" };
+  LOGC(LOGC_SYS, "[PAD] CHID input type -> %d (%s)\n", t,
+       (t >= 0 && t <= 2) ? kNames[t] : "unknown");
+}
+
+/* ---- eager pad detection ------------------------------------------------------
+ *
+ * CHID::CheckForInputChange (0x149198) only builds a CHIDJoystickXbox360 --
+ * which is also what makes CHID::Implements() start drawing pad icons -- once
+ * it samples a button the engine's own ButtonContainer reports as currently
+ * held (state 2) or just released (state 3), or a stick axis past 75%. Until
+ * then CHID::GetInputType() stays 0 (touchscreen), so no icon can be shown no
+ * matter what implOnGamepadButtonDown we send it.
+ *
+ * Left to the user, the first thing that satisfies that sample is whatever
+ * they press first -- typically A on the "Tap Or Press A" splash, which is
+ * ALSO CPad::MenuInputAcceptJustDown's button (mapping 37, bound to both
+ * button 0 and button 4 in the Xbox360 map at 0x14a8dc). So the very press
+ * that reveals the A icon is the same press that dismisses the screen the
+ * icon was drawn on, and it is visible for at most one frame.
+ *
+ * L3 (button 12) is not bound to any CMenuManager navigation action -- only to
+ * CPad::GetToggleSubmission (gameplay-only) and, jointly with R3, to
+ * CPad::ToggleCheatMenu (0x219a48), which requires a release/press pair
+ * across BOTH sticks and so cannot fire from a solo L3 tap (verified: with R3
+ * never touched, every branch that could set the result reads R3's state and
+ * stays false). A single synthetic L3 press the moment the pad is seen is
+ * therefore invisible everywhere it might land, and it satisfies
+ * CheckForInputChange before the user's first real press -- so every icon,
+ * including this one, is already showing when the splash screen first draws,
+ * and that first real press goes back to meaning only what it actually means. */
+static void eager_pad_detect(void) {
+  enum { PD_WAIT, PD_HOLDING, PD_DONE };
+  static int state = PD_WAIT;
+  static int hold_frames = 0;
+
+  if (state == PD_WAIT) {
+    if (pad_reported_count > 0) {
+      if (implOnGamepadButtonDown) implOnGamepadButtonDown(fake_env, NULL, 0, 12);
+      hold_frames = 0;
+      state = PD_HOLDING;
+    }
+  } else if (state == PD_HOLDING) {
+    /* A few frames of "held" comfortably clears the state-2 sample window
+     * regardless of exactly when in the frame CheckForInputChange runs. */
+    if (++hold_frames >= 3) {
+      if (implOnGamepadButtonUp) implOnGamepadButtonUp(fake_env, NULL, 0, 12);
+      state = PD_DONE;
+    }
+  }
+}
+
+/* ---- menu auto-repeat -------------------------------------------------------
+ *
+ * The engine gives the frontend one step per press and never repeats: the four
+ * CPad::MenuInput*JustDown predicates resolve to CHID::IsJustPressed, which for
+ * a digital button means LIB_GamepadState == 2 (true for a single frame) and for
+ * a stick axis means a flag that CHIDJoystick::CacheAnalogValues (0x14a534) sets
+ * only on the centre-to-deflected edge -- it clears the flag at the top of every
+ * call and re-arms it only when the PREVIOUS cached sample was inside the 0.1
+ * deadzone. So holding a direction moves the highlight exactly once, which is
+ * what makes long lists feel slow.
+ *
+ * These latches add the missing repeat. They deliberately do not fire on the
+ * initial press -- the engine already reports that one -- so a tap still moves
+ * exactly one row and only a sustained hold repeats. Timing is in milliseconds
+ * rather than frames because the port runs at either 30 or 60 fps depending on
+ * config.fps_cap_30, and a frame-counted repeat would run at half speed on one
+ * of them. game.c ORs these into the predicates; they live for exactly one main
+ * loop iteration, the same lifetime as the engine's own just-pressed state, so
+ * an unconsumed pulse can never leak into a later menu. */
+/* One interval, used both before the first repeat and between every repeat
+ * after it. An initial delay longer than the repeat gap is what made the
+ * highlight sit still and then bolt: the movement has to read as one steady
+ * rate, only a little quicker than re-flicking the stick by hand. The interval
+ * still has to outlast a deliberate tap, or a single nudge would move two rows. */
+#define MENU_REPEAT_MS 220
+#define MENU_STICK_THRESHOLD 16000 /* ~50% of the +-32767 range */
+
+volatile int g_menu_repeat_up = 0, g_menu_repeat_down = 0;
+volatile int g_menu_repeat_left = 0, g_menu_repeat_right = 0;
+
+static void update_menu_repeat(u64 down, HidAnalogStickState ls) {
+  /* -1 / +1 per axis, from the d-pad or the left stick, whichever is active. */
+  int x = 0, y = 0;
+  if ((down & HidNpadButton_Left)  || ls.x < -MENU_STICK_THRESHOLD) x = -1;
+  if ((down & HidNpadButton_Right) || ls.x >  MENU_STICK_THRESHOLD) x =  1;
+  if ((down & HidNpadButton_Down)  || ls.y < -MENU_STICK_THRESHOLD) y = -1;
+  if ((down & HidNpadButton_Up)    || ls.y >  MENU_STICK_THRESHOLD) y =  1;
+
+  static int prev_x = 0, prev_y = 0;
+  static u64 last_pulse_x = 0, last_pulse_y = 0;
+
+  const u64 freq = armGetSystemTickFreq();
+  const u64 now = armGetSystemTick();
+  const u64 step = freq * MENU_REPEAT_MS / 1000;
+
+  g_menu_repeat_up = g_menu_repeat_down = 0;
+  g_menu_repeat_left = g_menu_repeat_right = 0;
+
+  if (x != prev_x) { prev_x = x; last_pulse_x = now; }
+  else if (x && now - last_pulse_x >= step) {
+    last_pulse_x = now;
+    if (x < 0) g_menu_repeat_left = 1; else g_menu_repeat_right = 1;
+  }
+
+  if (y != prev_y) { prev_y = y; last_pulse_y = now; }
+  else if (y && now - last_pulse_y >= step) {
+    last_pulse_y = now;
+    if (y < 0) g_menu_repeat_down = 1; else g_menu_repeat_up = 1;
+  }
+}
+
 static void update_gamepad(void) {
   padUpdate(&pad);
+  report_gamepad_count(padIsConnected(&pad) ? 1 : 0);
+  log_input_type_change();
+  eager_pad_detect();
+
   const u64 down = padGetButtons(&pad);
   const u64 changed = down ^ pad_prev;
 
@@ -336,11 +516,6 @@ static void update_gamepad(void) {
       }
     }
   }
-
-  if ((changed & HidNpadButton_Plus) && (down & HidNpadButton_Plus))
-    g_escape_pressed = 1;
-  if ((changed & HidNpadButton_Minus) && (down & HidNpadButton_Minus))
-    g_select_pressed = 1;
 
   const u64 cheat_combo = HidNpadButton_StickL | HidNpadButton_StickR;
   if ((changed & cheat_combo) && (down & cheat_combo) == cheat_combo)
@@ -355,6 +530,8 @@ static void update_gamepad(void) {
   const float ly = (float)ls.y * -scale;
   const float rx = (float)rs.x * scale;
   const float ry = (float)rs.y * -scale;
+  update_menu_repeat(down, ls);
+
   const float lt = (down & HidNpadButton_ZL) ? 1.0f : 0.0f;
   const float rt = (down & HidNpadButton_ZR) ? 1.0f : 0.0f;
 
@@ -486,9 +663,6 @@ int main(void) {
   debugPrintf("[MAIN] Triggering implOnResume...\n");
   implOnResume(fake_env, gn_class);
   debugPrintf("[MAIN] implOnResume finished.\n");
-
-  if (implOnGamepadConnected)
-    implOnGamepadConnected(fake_env, gn_class, 0);
 
   padConfigureInput(8, HidNpadStyleSet_NpadStandard);
   padInitializeAny(&pad);
