@@ -785,10 +785,23 @@ void movie_render(void *display, void *surface) {
   if (!atomic_load(&m->playing)) return;
   if (!mv_gl_init()) return;
 
-  EGLint sw = 0, sh = 0;
-  eglQuerySurface((EGLDisplay)display, (EGLSurface)surface, EGL_WIDTH, &sw);
-  eglQuerySurface((EGLDisplay)display, (EGLSurface)surface, EGL_HEIGHT, &sh);
-  if (sw <= 0 || sh <= 0) { sw = 1280; sh = 720; }
+  /* Deliberately not eglQuerySurface. This window is resized with
+   * nwindowSetDimensions before eglCreateWindowSurface, and the query goes on
+   * answering with the window's default 1280x720 even when the surface really
+   * is 1920x1080. Docked, that put glViewport over the bottom-left two thirds
+   * of the framebuffer and the video with it. screen_width/screen_height is
+   * what the rest of the port is built on -- the OS_ScreenGetWidth/Height
+   * patches, RsGlobal, implOnSurfaceChanged -- and it agrees with the viewport
+   * the engine itself sets, so it is the size to letterbox against. */
+  EGLint egl_w = 0, egl_h = 0;
+  eglQuerySurface((EGLDisplay)display, (EGLSurface)surface, EGL_WIDTH, &egl_w);
+  eglQuerySurface((EGLDisplay)display, (EGLSurface)surface, EGL_HEIGHT, &egl_h);
+
+  int sw = screen_width, sh = screen_height;
+  if (sw <= 0 || sh <= 0) {
+    sw = (egl_w > 0) ? egl_w : 1280;
+    sh = (egl_h > 0) ? egl_h : 720;
+  }
 
   /* Save every piece of state we disturb: the engine is mid-render and gets
    * the context back untouched, exactly as the FPS overlay does. */
@@ -855,6 +868,21 @@ void movie_render(void *display, void *surface) {
     if ((float)vh * scale > (float)sh) scale = (float)sh / (float)vh;
     const float hx = ((float)vw * scale) / (float)sw;  /* half-width in NDC */
     const float hy = ((float)vh * scale) / (float)sh;
+
+    /* The quad is centred in NDC by construction, so a movie that lands
+     * off-centre means the surface we measured is not the one being scanned
+     * out. Report every input to that decision, plus the viewport the engine
+     * had, so a docked run can be compared against a handheld one. */
+    static int dbg_sw = -1, dbg_sh = -1, dbg_vw = -1, dbg_vh = -1;
+    if (sw != dbg_sw || sh != dbg_sh || vw != dbg_vw || vh != dbg_vh) {
+      dbg_sw = sw; dbg_sh = sh; dbg_vw = vw; dbg_vh = vh;
+      LOGC(LOGC_SYS,
+           "[MOVIE_GEOM] using=%dx%d (eglQuerySurface said %dx%d) video=%dx%d "
+           "screen=%dx%d %s engine_vp=%d,%d %dx%d scale=%.4f hx=%.4f hy=%.4f\n",
+           sw, sh, (int)egl_w, (int)egl_h, vw, vh, screen_width, screen_height,
+           appletGetOperationMode() == AppletOperationMode_Console ? "DOCKED" : "HANDHELD",
+           old_vp[0], old_vp[1], old_vp[2], old_vp[3], scale, hx, hy);
+    }
 
     const GLfloat quad[6][4] = {
       { -hx,  hy, 0.0f, 0.0f }, {  hx,  hy, 1.0f, 0.0f }, { -hx, -hy, 0.0f, 1.0f },

@@ -253,22 +253,32 @@ static void flush_quads(float sw, float sh, float r, float g, float b, float a,
 static void draw_overlay(void *display, void *surface) {
   if (!overlay_gl_init()) return;
 
-  EGLint w = 0, h = 0;
-  eglQuerySurface((EGLDisplay)display, (EGLSurface)surface, EGL_WIDTH, &w);
-  eglQuerySurface((EGLDisplay)display, (EGLSurface)surface, EGL_HEIGHT, &h);
-  if (w <= 0 || h <= 0) { w = 1280; h = 720; }
+  /* Same trap the movie player fell into: eglQuerySurface keeps reporting the
+   * window's default 1280x720 after nwindowSetDimensions has resized it, so
+   * docked it under-reports a 1920x1080 surface. flush_quads() turns this into
+   * a glViewport, which put the whole overlay inside the bottom-left two thirds
+   * of the screen. screen_width/screen_height is the size the engine's own
+   * viewport agrees with. */
+  EGLint egl_w = 0, egl_h = 0;
+  eglQuerySurface((EGLDisplay)display, (EGLSurface)surface, EGL_WIDTH, &egl_w);
+  eglQuerySurface((EGLDisplay)display, (EGLSurface)surface, EGL_HEIGHT, &egl_h);
+
+  int w = screen_width, h = screen_height;
+  if (w <= 0 || h <= 0) {
+    w = (egl_w > 0) ? egl_w : 1280;
+    h = (egl_h > 0) ? egl_h : 720;
+  }
 
   char l1[64], l2[64], l3[64];
   snprintf(l1, sizeof(l1), "FPS %.0f  %.1fms", current_fps, last_frame_ms);
   snprintf(l2, sizeof(l2), "PEAK %.0fms  FRZ %u/%u", worst_recent_ms,
            freeze_count, slow_count);
 
-  /* Third line reports what is actually being rendered rather than what was
-   * configured: the surface size comes from EGL, so a resolution that did not
-   * take shows up here. The dock state is queried every frame because it can
-   * change at any moment, and the two together are what make a frame-rate
-   * number comparable between runs -- 1280x720 handheld and 1920x1080 docked
-   * are very different amounts of work. */
+  /* Third line reports the size actually being rendered at. The dock state is
+   * queried every frame because it can change at any moment, and the two
+   * together are what make a frame-rate number comparable between runs --
+   * 1280x720 handheld and 1920x1080 docked are very different amounts of
+   * work. */
   const bool docked = (appletGetOperationMode() == AppletOperationMode_Console);
   snprintf(l3, sizeof(l3), "%dx%d  %s", (int)w, (int)h, docked ? "DOCKED" : "HANDHELD");
 
