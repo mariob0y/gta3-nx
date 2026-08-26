@@ -13,6 +13,7 @@
 #include <switch.h>
 #include <pthread.h>
 #include <GLES2/gl2.h>
+#include <EGL/egl.h>
 
 #include "config.h"
 #include "util.h"
@@ -23,6 +24,8 @@
 #include "jni_fake.h"
 #include "path_cache.h"
 #include "stream_cache.h"
+#include "movie.h"
+#include "overlay.h"
 
 static void *heap_so_base = NULL;
 static size_t heap_so_limit = 0;
@@ -150,13 +153,24 @@ static void set_screen_size(int w, int h) {
  * L2/R2 have no button ID at all in this build -- the Xbox360 map reaches them
  * only as axes 68/69, so ZL/ZR go through implOnGamepadAxesChanged instead.
  *
- * Face buttons are matched by LETTER, not by position. The engine draws its
- * help icons from assets/es2/buttonsxbox360.png, and FindUVsFromMapping
- * (0x14accc) indexes that atlas by button ID: 0->A, 1->B, 2->X, 3->Y. Mapping
- * Switch A to CROSS therefore makes the on-screen glyph always name the button
- * actually under the thumb, and lands confirm on A / cancel on B, which is the
- * Nintendo convention. The cost is that the layout is rotated relative to the
- * PS2 original (enter-vehicle sits on Y rather than the top button).
+ * Face buttons follow the PS2 layout the engine was built around, with A and B
+ * swapped back so the console's own convention survives:
+ *
+ *   SQUARE   -> Y   left button, as on a PS pad     (brake / reverse)
+ *   TRIANGLE -> X   top button, as on a PS pad      (enter vehicle)
+ *   CROSS    -> A   confirm, Nintendo-style         (accelerate)
+ *   CIRCLE   -> B   back, Nintendo-style            (fire)
+ *
+ * So the left/top pair keeps its PlayStation meaning while A still confirms and
+ * B still backs out, which is what a Switch player reaches for.
+ *
+ * That leaves the help icons half wrong on their own: FindUVsFromMapping
+ * (0x14accc) picks the cell out of assets/es2/buttonsxbox360.png using the
+ * button ID as the atlas row -- 0->A, 1->B, 2->X, 3->Y. CROSS and CIRCLE
+ * already line up, but SQUARE would draw "X" while sitting on Y, and TRIANGLE
+ * would draw "Y" while sitting on X. patch_glyph_button_letters() in
+ * hooks/game.c fixes that end. The two changes only make sense together --
+ * change one and the prompts start lying.
  * --------------------------------------------------------------------------- */
 typedef struct {
   u64 hid;
@@ -164,10 +178,10 @@ typedef struct {
 } PadMap;
 
 static const PadMap pad_map[] = {
-  { HidNpadButton_A,       0 },  // CROSS    -- accelerate / confirm   (icon A)
-  { HidNpadButton_B,       1 },  // CIRCLE   -- fire / cancel          (icon B)
-  { HidNpadButton_X,       2 },  // SQUARE   -- brake                  (icon X)
-  { HidNpadButton_Y,       3 },  // TRIANGLE -- enter vehicle          (icon Y)
+  { HidNpadButton_A,       0 },  // CROSS    -- accelerate / confirm  (prompt: A)
+  { HidNpadButton_B,       1 },  // CIRCLE   -- fire / back           (prompt: B)
+  { HidNpadButton_Y,       2 },  // SQUARE   -- brake                 (prompt: Y)
+  { HidNpadButton_X,       3 },  // TRIANGLE -- enter vehicle         (prompt: X)
   { HidNpadButton_Plus,    4 },  // START    -- pause menu
   { HidNpadButton_Minus,   5 },  // SELECT   -- radar / map
   { HidNpadButton_L,       6 },  // L1
@@ -525,6 +539,19 @@ static void update_gamepad(void) {
   if ((changed & cheat_combo) && (down & cheat_combo) == cheat_combo)
     open_cheat_keyboard();
 
+  /* L + R + D-pad Down summons the FPS overlay mid-game, so it no longer means
+   * editing gta3_nx.cfg and relaunching. Down is the trigger edge rather than
+   * the shoulders, so holding L and R through normal play arms nothing; only
+   * the d-pad press completes it. The buttons still reach the game -- swallowing
+   * them would need the combo to be recognised before the pad table is walked,
+   * and a stray look-left is a smaller cost than a missed input. */
+  const u64 fps_combo = HidNpadButton_L | HidNpadButton_R | HidNpadButton_Down;
+  if ((changed & HidNpadButton_Down) && (down & fps_combo) == fps_combo) {
+    config.show_fps_overlay = !config.show_fps_overlay;
+    debugPrintf("[OVERLAY] FPS overlay toggled %s by pad combo\n",
+                config.show_fps_overlay ? "ON" : "OFF");
+  }
+
   pad_prev = down;
 
   const float scale = 1.f / 32767.0f;
@@ -586,8 +613,13 @@ int main(void) {
   setenv("MESA_SHADER_CACHE_DIR", "/switch/gta3/shadercache", 1);
   setenv("MESA_SHADER_CACHE_DISABLE", "false", 1);
 
-  if (read_config(CONFIG_NAME) < 0)
-    write_config(CONFIG_NAME);
+  /* Write the config back every boot, not just when it is missing. Any key the
+   * file does not mention keeps its default silently, so an option added after
+   * the file was first created would never appear in it and nobody would know
+   * it existed. Rewriting keeps gta3_nx.cfg a complete list of what can be
+   * changed. */
+  read_config(CONFIG_NAME);
+  write_config(CONFIG_NAME);
 
   check_syscalls();
   check_data();
@@ -714,12 +746,18 @@ int main(void) {
 
     // Proactive CPU Boost Evaluation before entering frame work
     if (boot_frames >= 10) {
-      bool active_streaming = (sc_debug_active_slots() > 0) || streaming_activity_recent(250.0);
+      /* A movie counts as work worth the clock for the same reason streaming
+       * does: software H.264 has a hard real-time deadline, and missing it is
+       * visible as a stuttering intro. */
+      bool movie_running = movie_is_playing();
+      bool active_streaming = movie_running ||
+                              (sc_debug_active_slots() > 0) || streaming_activity_recent(250.0);
       if (active_streaming) {
         if (!s_boost_active) {
           cpu_boost(1);
           s_boost_active = 1;
-          LOGC(LOGC_SYS, "[CPU_BOOST] ON reason=world_stream (frame #%u)\n", g_frame_count);
+          LOGC(LOGC_SYS, "[CPU_BOOST] ON reason=%s (frame #%u)\n",
+               movie_running ? "intro_movie" : "world_stream", g_frame_count);
         }
         s_heavy_frames = 0;
         s_boost_turn_off_tick = armGetSystemTick() + (u64)(tick_freq * 1.5f); // Keep boost active for 1.5s quiet
@@ -750,6 +788,35 @@ int main(void) {
     u64 t_frame0 = g_frame_start_tick;
     implOnDrawFrame(fake_env, NULL, dt);
     g_frame_start_tick = 0;
+
+    /* While an intro movie runs, OS_ApplicationTick only polls whether it has
+     * finished -- it renders nothing and so never reaches the RenderWare path
+     * that presents a frame. On Android that was fine, because the movie was a
+     * Java surface layered over the GL view; here the video is drawn inside the
+     * eglSwapBuffers hook, so the swap has to come from us instead. */
+    if (movie_is_playing()) {
+      /* Skip. MovieCancel() only inspects CControllerConfigManager's legacy
+       * joystick state, the raw keyboard arrays and LIB_PointerGetButton --
+       * none of which this port feeds, since our pad goes in through CHID. So
+       * the engine can never skip a movie from a Joy-Con and the player is
+       * stuck watching it. Do it here: ending the movie makes isMoviePlaying()
+       * report false, and the engine's wait state then advances exactly as if
+       * it had run to the end. */
+      static const u64 kMovieSkipButtons =
+          HidNpadButton_A | HidNpadButton_B | HidNpadButton_X | HidNpadButton_Y |
+          HidNpadButton_Plus | HidNpadButton_Minus |
+          HidNpadButton_L | HidNpadButton_R | HidNpadButton_ZL | HidNpadButton_ZR;
+
+      if (padGetButtonsDown(&pad) & kMovieSkipButtons) {
+        movie_stop();
+      } else if (movie_should_present()) {
+        EGLDisplay dpy = eglGetCurrentDisplay();
+        EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
+        if (dpy != EGL_NO_DISPLAY && surf != EGL_NO_SURFACE)
+          nx_present_movie_frame(dpy, surf);
+      }
+    }
+
     g_active_phase = "FrameLimiter";
 
     double frame_work_ms = (double)armTicksToNs(armGetSystemTick() - t_frame0) / 1e6;
@@ -770,7 +837,12 @@ int main(void) {
     }
 
     if (boot_frames < 10) {
-      if (++boot_frames == 10)
+      /* The intro movies start around frame 5, and movie_play() raises the
+       * clock for them. Dropping it here would undo that a few frames later and
+       * leave the decoder running at the low clock -- which is exactly what
+       * held the logo to ~14 of its 25 frames a second. movie_stop() lowers it
+       * again when playback ends. */
+      if (++boot_frames == 10 && !movie_is_playing())
         cpu_boost(0);
     }
 

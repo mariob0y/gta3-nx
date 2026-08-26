@@ -48,6 +48,7 @@
 #include <switch.h>
 
 #include "config.h"
+#include "movie.h"
 #include "so_util.h"
 #include "util.h"
 #include "libc_shim.h"
@@ -175,7 +176,19 @@ static void glDeleteProgram_c(GLuint p) {
 }
 
 extern unsigned int eglSwapBuffersHook(void *display, void *surface);
+
+/* Set only around the movie player's own present, so the guard below can tell
+ * that swap apart from one the engine initiated. */
+static _Atomic int g_movie_presenting = 0;
+
 static unsigned int eglSwapBuffers_cache(void *display, void *surface) {
+  /* While an intro movie owns the screen, the only swap that may reach the
+   * display is the movie's own. The engine draws nothing during its movie wait
+   * states, so any swap it makes would present a swapchain image nobody
+   * rendered into. */
+  if (movie_is_playing() && !atomic_load(&g_movie_presenting))
+    return 1; /* EGL_TRUE: tell the engine the frame went out */
+
   static unsigned frame_cnt = 0;
   if ((frame_cnt++ % 60) == 0)
     LOGC(LOGC_EGL, "[EGL] eglSwapBuffers frame #%u (dpy=%p, surf=%p)\n", frame_cnt, display, surface);
@@ -187,6 +200,17 @@ static unsigned int eglSwapBuffers_cache(void *display, void *surface) {
   if (swap_ms >= 5.0) {
     LOGC(LOGC_SYS, "[FRAME_SPLIT] SLOW SWAP: took %.2f ms\n", swap_ms);
   }
+  return r;
+}
+
+/* The movie player's present. It goes through the same wrapper as the engine's
+ * so the GL state cache is reset for it too -- movie.c calls real GL entry
+ * points directly, and the cache's shadow of program/texture/blend state has to
+ * be invalidated or the engine's next frame will trust stale bookkeeping. */
+unsigned int nx_present_movie_frame(void *display, void *surface) {
+  atomic_store(&g_movie_presenting, 1);
+  unsigned int r = eglSwapBuffers_cache(display, surface);
+  atomic_store(&g_movie_presenting, 0);
   return r;
 }
 

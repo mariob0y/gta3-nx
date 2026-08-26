@@ -24,6 +24,7 @@ Config config = {
   .streaming_budget_ms = 5.0f,
   .show_fps_overlay = 0,
   .debug_log_enabled = 0,
+  .intro_movies = 1,
 };
 
 int read_config(const char *file) {
@@ -45,6 +46,7 @@ int read_config(const char *file) {
       else if (strcmp(key, "streaming_budget_ms") == 0) config.streaming_budget_ms = (float)atof(val);
       else if (strcmp(key, "show_fps_overlay") == 0) config.show_fps_overlay = atoi(val);
       else if (strcmp(key, "debug_log_enabled") == 0) config.debug_log_enabled = atoi(val);
+      else if (strcmp(key, "intro_movies") == 0) config.intro_movies = atoi(val);
     }
   }
 

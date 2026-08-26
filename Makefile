@@ -44,7 +44,12 @@ LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*
 
 # -lSDL2 is not used by our code, but devkitPro's libopenal.a is built with
 # an SDL2 audio backend and pulls in SDL_OpenAudioDevice et al.
+#
+# ffmpeg (switch-ffmpeg) decodes the H.264 + AAC intro movies in source/movie.c.
+# -lbz2 and -ldav1d are transitive dependencies of libavformat/libavcodec, and
+# have to sit after them for the static link to resolve.
 LIBS	:= -lopenal -lSDL2 -lmpg123 \
+			-lavformat -lavcodec -lswresample -lavutil -lbz2 -ldav1d \
 			-lEGL -lGLESv2 -lglapi -ldrm_nouveau -lexpat -lzstd -lz -lnx -lm
 
 #---------------------------------------------------------------------------------

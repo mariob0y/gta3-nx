@@ -37,6 +37,7 @@ typedef struct {
   float streaming_budget_ms;
   int show_fps_overlay;   // on-screen FPS/frame-time overlay (off by default)
   int debug_log_enabled;  // write gta3_log.txt to disk (off by default)
+  int intro_movies;       // play the Rockstar logo / title movies at boot
 } Config;
 
 extern Config config;

@@ -110,6 +110,27 @@ Open the homebrew menu and pick **Grand Theft Auto III**.
 
 ---
 
+## Controls
+
+The face buttons keep the PlayStation layout the game was designed around, with A and B
+swapped so the console's own convention survives — **A confirms, B backs out**:
+
+| Switch | Original | In game |
+| --- | --- | --- |
+| **A** | ✕ Cross | accelerate, menu confirm |
+| **B** | ○ Circle | fire, menu back |
+| **Y** | ▢ Square | brake / reverse |
+| **X** | △ Triangle | enter vehicle |
+
+On-screen prompts name the button you actually press. The game's help icons are indexed
+by the original button number, so the port rewrites that lookup to match the pad in your
+hands rather than leaving every prompt one letter out.
+
+Press **L3 + R3** to open the cheat entry keyboard, and **L + R + D-pad Down** to toggle
+the performance overlay. Any face or shoulder button skips an intro movie.
+
+---
+
 ## Configuration
 
 `gta3_nx.cfg` sits next to the `.nro` and is written with defaults on first launch.
@@ -121,12 +142,15 @@ Open the homebrew menu and pick **Grand Theft Auto III**.
 | `trilinear_filter` | `1` | trilinear texture filtering |
 | `fps_cap_30` | `1` | `1` = 30 FPS cap, `0` = uncapped to 60 |
 | `streaming_budget_ms` | `5.0` | per-frame time budget for streaming work |
-| `show_fps_overlay` | `0` | on-screen FPS / frame-time / freeze counter (top-left) |
+| `show_fps_overlay` | `0` | on-screen FPS / frame-time / freeze counter, plus resolution and dock state (top-left) |
+| `intro_movies` | `1` | play the Rockstar logo and title movies at boot; `0` skips straight to the menu |
 | `debug_log_enabled` | `0` | write `gta3_log.txt` to the SD card |
 | `log_mask` | `0x...` | bitmask of log categories, only meaningful with logging on |
 
 Set `show_fps_overlay=1` and `debug_log_enabled=1` if you are filing a performance issue.
-Both are off by default because writing to the SD card every frame costs frames.
+Both are off by default because writing to the SD card every frame costs frames. The
+overlay can also be summoned mid-game with **L + R + D-pad Down**, which does not need a
+config edit or a relaunch (it is not remembered between launches).
 
 ---
 
@@ -136,8 +160,10 @@ You need [devkitPro](https://devkitpro.org/wiki/Getting_Started) with the Switch
 
 ```bash
 pacman -S switch-dev switch-mesa switch-libdrm_nouveau switch-openal-soft \
-          switch-sdl2 switch-mpg123 switch-libexpat switch-libzstd switch-zlib
+          switch-sdl2 switch-mpg123 switch-libexpat switch-libzstd switch-zlib \
+          switch-ffmpeg
 ```
+
 
 Then, **from PowerShell** (see the warning below):
 

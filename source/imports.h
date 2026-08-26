@@ -23,6 +23,11 @@ extern size_t dynlib_numfunctions;
 
 void update_imports(void);
 
+/* Presents one movie frame through the same swap wrapper the engine uses, so
+ * the GL state cache is reset and the engine's own swaps stay suppressed for
+ * the duration. See source/movie.c. */
+unsigned int nx_present_movie_frame(void *display, void *surface);
+
 #ifdef __cplusplus
 }
 #endif

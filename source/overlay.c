@@ -27,6 +27,7 @@
 #include "config.h"
 #include "util.h"
 #include "overlay.h"
+#include "movie.h"
 #include "font_atlas.h"
 
 extern uint32_t g_frame_count;
@@ -257,19 +258,31 @@ static void draw_overlay(void *display, void *surface) {
   eglQuerySurface((EGLDisplay)display, (EGLSurface)surface, EGL_HEIGHT, &h);
   if (w <= 0 || h <= 0) { w = 1280; h = 720; }
 
-  char l1[64], l2[64];
+  char l1[64], l2[64], l3[64];
   snprintf(l1, sizeof(l1), "FPS %.0f  %.1fms", current_fps, last_frame_ms);
   snprintf(l2, sizeof(l2), "PEAK %.0fms  FRZ %u/%u", worst_recent_ms,
            freeze_count, slow_count);
 
+  /* Third line reports what is actually being rendered rather than what was
+   * configured: the surface size comes from EGL, so a resolution that did not
+   * take shows up here. The dock state is queried every frame because it can
+   * change at any moment, and the two together are what make a frame-rate
+   * number comparable between runs -- 1280x720 handheld and 1920x1080 docked
+   * are very different amounts of work. */
+  const bool docked = (appletGetOperationMode() == AppletOperationMode_Console);
+  snprintf(l3, sizeof(l3), "%dx%d  %s", (int)w, (int)h, docked ? "DOCKED" : "HANDHELD");
+
   const float scale = 0.55f;
   const float pad = 8.0f;
   const float lh = FONT_CELL_H * scale;
-  size_t n1 = strlen(l1), n2 = strlen(l2);
-  float tw = (float)((n1 > n2) ? n1 : n2) * FONT_CELL_W * scale;
+
+  size_t longest = strlen(l1);
+  if (strlen(l2) > longest) longest = strlen(l2);
+  if (strlen(l3) > longest) longest = strlen(l3);
+  const float tw = (float)longest * FONT_CELL_W * scale;
 
   /* Backing panel first, so the text stays readable over bright scenery. */
-  push_quad(pad - 4.0f, pad - 4.0f, pad + tw + 4.0f, pad + lh * 2.0f + 4.0f,
+  push_quad(pad - 4.0f, pad - 4.0f, pad + tw + 4.0f, pad + lh * 3.0f + 4.0f,
             0.0f, 0.0f, 0.0f, 0.0f);
   flush_quads((float)w, (float)h, 0.0f, 0.0f, 0.0f, 0.55f, 0.0f);
 
@@ -282,6 +295,10 @@ static void draw_overlay(void *display, void *surface) {
     flush_quads((float)w, (float)h, 1.0f, 0.35f, 0.25f, 1.0f, 1.0f);
   else
     flush_quads((float)w, (float)h, 0.75f, 0.85f, 0.75f, 1.0f, 1.0f);
+
+  /* Third line is context, not a warning, so it stays dimmer than the rest. */
+  push_text(l3, pad, pad + lh * 2.0f, scale);
+  flush_quads((float)w, (float)h, 0.65f, 0.75f, 0.95f, 1.0f, 1.0f);
 }
 
 unsigned int eglSwapBuffersHook(void *display, void *surface) {
@@ -332,6 +349,10 @@ unsigned int eglSwapBuffersHook(void *display, void *surface) {
                 current_fps, stream_ms, worst_index, worst_ms,
                 dt_ms - stream_ms);
   }
+
+  /* An intro movie owns the whole frame while it plays, so it goes down first
+   * and the FPS overlay stays on top of it. */
+  movie_render(display, surface);
 
   if (config.show_fps_overlay)
     draw_overlay(display, surface);

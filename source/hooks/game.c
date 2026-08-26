@@ -3458,6 +3458,203 @@ void setup_subsystem_phase_hooks(void) {
        game_mod.tramp_used, SO_TRAMPOLINE_SIZE, installed_count);
 }
 
+/* ---------------------------------------------------------------------------
+ * Frontend trims
+ *
+ * Two things the mobile frontend does that make no sense on a console: it makes
+ * you page through two screens of Take-Two copyright text every single launch,
+ * and it offers Rockstar Social Club rows that this port can never satisfy.
+ *
+ * The menu table is shared by both. aScreens is an array of fixed-size screen
+ * records; the sizes below were read out of this exact libGame.so rather than
+ * from re3, whose CMenuScreen is a 32-bit PC layout and does not match:
+ *
+ *   screen record  412 bytes  (the 0x19c that CMenuManager::DrawFrontEnd,
+ *                              ProcessButtonPresses and Process all multiply
+ *                              m_nCurrScreen by)
+ *   header          52 bytes  char m_ScreenName[8] then eleven int32s
+ *   entry           20 bytes  int32 action, char name[8], int32 slot, int32 target
+ *   rows per screen 18        (412 - 52) / 20
+ *   screens         59        aScreens is 0x5ef4 bytes = 59 * 412
+ *
+ * Everything below re-checks the screen name it found before writing, so a
+ * libGame.so with a different table is left alone rather than corrupted.
+ * ------------------------------------------------------------------------- */
+
+#define FE_SCREEN_STRIDE 412
+#define FE_ENTRY_OFFSET   52
+#define FE_NUM_ROWS       18
+#define FE_NUM_SCREENS    59
+
+typedef struct {
+  int32_t action;
+  char    name[8];
+  int32_t save_slot;
+  int32_t target;
+} FeEntry;
+
+_Static_assert(sizeof(FeEntry) == 20, "menu entry must match the 20-byte engine layout");
+
+/* The Options page's two Rockstar Social Club rows, by GXT key: "Sign In"
+ * (action 122) and "Delete Account" (action 123). Neither can do anything in a
+ * port with no Social Club backing, and Delete Account without a sign-in is
+ * doubly dead, so both come out.
+ *
+ * Each row is dropped by closing the gap behind it and blanking the freed tail
+ * row. Shifting rather than blanking in place matters: the frontend stops at
+ * the first empty row, so zeroing Sign In where it sat would also have hidden
+ * everything below it, Main Menu included. */
+static const char *const kDeadOptionRows[] = { "MM_SGI", "MM_DEL" };
+
+static void frontend_remove_social_club_rows(void) {
+  /* This edit lands during patch_game, before so_finalize() has mapped the
+   * executable alias, so it has to go through load_base -- the same alias every
+   * other one-shot patch here writes through. (The legal-screen globals below
+   * are the mirror case: they are only touched at runtime, once load_base has
+   * become Perm_None, so those use the load_virtbase alias instead.) */
+  if (!so_try_find_addr_rx(&game_mod, "aScreens")) {
+    debugPrintf("[FRONTEND] WARNING: aScreens symbol not found -- Social Club rows left in place\n");
+    return;
+  }
+  uint8_t *screens = (uint8_t *)so_find_addr(&game_mod, "aScreens");
+
+  for (int s = 0; s < FE_NUM_SCREENS; s++) {
+    uint8_t *screen = screens + (size_t)s * FE_SCREEN_STRIDE;
+    if (strncmp((const char *)screen, "FET_OPT", 8) != 0)
+      continue;
+
+    FeEntry *rows = (FeEntry *)(screen + FE_ENTRY_OFFSET);
+    int removed = 0;
+    for (size_t k = 0; k < sizeof(kDeadOptionRows) / sizeof(*kDeadOptionRows); k++) {
+      for (int r = 0; r < FE_NUM_ROWS; r++) {
+        if (strncmp(rows[r].name, kDeadOptionRows[k], 8) != 0)
+          continue;
+        memmove(&rows[r], &rows[r + 1], (size_t)(FE_NUM_ROWS - 1 - r) * sizeof(FeEntry));
+        memset(&rows[FE_NUM_ROWS - 1], 0, sizeof(FeEntry));
+        LOGC(LOGC_SYS, "[FRONTEND] Removed Options row '%s' at index %d (screen %d)\n",
+             kDeadOptionRows[k], r, s);
+        removed++;
+        break;
+      }
+    }
+    if (removed == 0)
+      debugPrintf("[FRONTEND] WARNING: Options page has none of the Social Club rows -- nothing removed\n");
+    return;
+  }
+  debugPrintf("[FRONTEND] WARNING: no FET_OPT screen in aScreens -- Social Club rows left in place\n");
+}
+
+/* The legal screens live inside CMenuManager::DrawFrontEndNormal, driven by
+ * three file-scope globals:
+ *
+ *   legalScreenState  0 = the "Tap / Press A To Continue" title screen
+ *                     1 = copyright page one    2 = page two    3 = done
+ *   legalScreenSlerp  crossfade timer; ProcessButtonPresses sets it to 1.0 when
+ *                     the player confirms, and the fade crossing 0.5 is what
+ *                     advances the state
+ *   shownLegalScreen  latched to 1 once state reaches 3, after which the draw
+ *                     goes straight to the normal menu
+ *
+ * So the confirm press on the title screen is the moment the legal sequence
+ * begins, and latching shownLegalScreen right there skips both copyright pages
+ * without touching the title screen itself. Doing it in a wrapper around the
+ * draw, rather than polling from the main loop, means the very frame that would
+ * have shown page one already takes the "legal finished" branch. */
+static uint8_t *g_shown_legal_screen = NULL;
+static int32_t *g_legal_screen_state = NULL;
+static float   *g_legal_screen_slerp = NULL;
+
+typedef void (*Func_DrawFrontEndNormal)(void *this_ptr);
+static Func_DrawFrontEndNormal orig_DrawFrontEndNormal = NULL;
+
+static void wrap_DrawFrontEndNormal(void *this_ptr) {
+  if (g_shown_legal_screen && g_legal_screen_state && g_legal_screen_slerp &&
+      !*g_shown_legal_screen &&
+      (*g_legal_screen_state != 0 || *g_legal_screen_slerp != 0.0f)) {
+    *g_shown_legal_screen = 1;
+    *g_legal_screen_state = 3;
+    *g_legal_screen_slerp = 0.0f;
+    LOGC(LOGC_SYS, "[FRONTEND] Skipped the legal/copyright pages\n");
+  }
+  if (orig_DrawFrontEndNormal) orig_DrawFrontEndNormal(this_ptr);
+}
+
+static void frontend_skip_legal_pages(void) {
+  g_shown_legal_screen = (uint8_t *)so_try_find_addr_rx(&game_mod, "shownLegalScreen");
+  g_legal_screen_state = (int32_t *)so_try_find_addr_rx(&game_mod, "legalScreenState");
+  g_legal_screen_slerp = (float *)so_try_find_addr_rx(&game_mod, "legalScreenSlerp");
+  if (!g_shown_legal_screen || !g_legal_screen_state || !g_legal_screen_slerp) {
+    debugPrintf("[FRONTEND] WARNING: legal screen globals not found -- pages left in place\n");
+    return;
+  }
+
+  uintptr_t addr = so_try_find_addr_rx(&game_mod, "_ZN12CMenuManager18DrawFrontEndNormalEv");
+  if (!addr) {
+    debugPrintf("[FRONTEND] WARNING: CMenuManager::DrawFrontEndNormal not found -- pages left in place\n");
+    return;
+  }
+  orig_DrawFrontEndNormal =
+      (Func_DrawFrontEndNormal)hook_arm64_trampoline(addr, (uintptr_t)wrap_DrawFrontEndNormal);
+  if (orig_DrawFrontEndNormal) {
+    LOGC(LOGC_SYS, "[FRONTEND] CMenuManager::DrawFrontEndNormal hooked at %p (legal pages will be skipped)\n",
+         (void *)addr);
+  } else {
+    debugPrintf("[FRONTEND] WARNING: REJECTED hook for CMenuManager::DrawFrontEndNormal (unrelocatable prologue)\n");
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Help-icon letters
+ *
+ * The pad follows the PS2 positions with A and B swapped back (see the table in
+ * main.c), so CROSS/CIRCLE/SQUARE/TRIANGLE land on Switch A/B/Y/X. The help
+ * icons would then be half wrong: CHIDJoystickXbox360::FindUVsFromMapping picks
+ * a cell out of assets/es2/buttonsxbox360.png, and for the four face buttons it
+ * uses the button ID directly as the atlas row -- 0 to A, 1 to B, 2 to X, 3 to
+ * Y. CROSS and CIRCLE already agree; SQUARE would draw "X" while sitting under
+ * Y, and TRIANGLE would draw "Y" while sitting under X.
+ *
+ * Two instructions assign that cell:
+ *
+ *   14ad0c  mov w10, #1     column 1, the face-button column
+ *   14ad10  mov w12, w13    row = button ID
+ *
+ * and the function's dispatch table at 0xe2aa5 sends only IDs 0..3 there (4..13
+ * are START/SELECT/shoulders/d-pad/sticks, each with its own case; 14 and above
+ * fall through to a no-op), so this row assignment governs the face buttons and
+ * nothing else.
+ *
+ * What is needed is 0->0, 1->1, 2->3, 3->2: leave A and B alone, swap X and Y.
+ * On two-bit values that is "keep bit 1, flip bit 0 when bit 1 is set", which
+ * `eor w12, w13, w13, lsr #1` computes in the single instruction slot available.
+ *
+ * The icons stay Xbox-styled, since that is the artwork the game ships; only
+ * the letters are corrected.
+ * ------------------------------------------------------------------------- */
+static void patch_glyph_button_letters(void) {
+  if (!so_try_find_addr_rx(&game_mod, "_ZN19CHIDJoystickXbox36018FindUVsFromMappingE10HIDMappingb11SpecialFlag")) {
+    debugPrintf("[FRONTEND] WARNING: FindUVsFromMapping not found -- help icons will show the wrong letters\n");
+    return;
+  }
+  uintptr_t fn = so_find_addr(&game_mod,
+      "_ZN19CHIDJoystickXbox36018FindUVsFromMappingE10HIDMappingb11SpecialFlag");
+
+  /* Offset 0x44 into the function is the `mov w12, w13`. Verify the exact
+   * encoding before writing: if this libGame.so differs, leave it alone rather
+   * than corrupt an instruction stream we have not understood. */
+  uint32_t *insn = (uint32_t *)(fn + 0x44);
+  const uint32_t expect_mov = 0x2a0d03ec; /* mov w12, w13              */
+  const uint32_t patch_eor  = 0x4a4d05ac; /* eor w12, w13, w13, lsr #1 */
+
+  if (*insn != expect_mov) {
+    debugPrintf("[FRONTEND] WARNING: FindUVsFromMapping+0x44 is 0x%08x, expected 0x%08x -- "
+                "help icon letters left unpatched\n", *insn, expect_mov);
+    return;
+  }
+  *insn = patch_eor;
+  LOGC(LOGC_SYS, "[FRONTEND] Help icon letters remapped for the Switch face layout (X<->Y)\n");
+}
+
 void patch_game(void) {
   debugPrintf("[HOOKS] Applying GTA III game patches and symbol hooks...\n");
   apply_streaming_memory_boost_staging();
@@ -3656,6 +3853,10 @@ void patch_game(void) {
   }
 
   setup_subsystem_phase_hooks();
+
+  frontend_remove_social_club_rows();
+  frontend_skip_legal_pages();
+  patch_glyph_button_letters();
 
   set_thread_core(0);
   LOGC(LOGC_SYS, "[HOOKS] Finished applying GTA III game patches.\n");

@@ -18,6 +18,7 @@
 #include "config.h"
 #include "util.h"
 #include "jni_fake.h"
+#include "movie.h"
 
 #define JNI_OK 0
 #define JNI_VERSION_1_6 0x00010006
@@ -297,6 +298,29 @@ static void hal_void(const FakeID *id, va_list va) {
     return;
   }
 
+  // --- intro movies ---------------------------------------------------------
+  // OS_MoviePlay / OS_MovieStop land here. movie.c reports failure for a
+  // missing or undecodable file, and isMoviePlaying() below then answers false
+  // straight away, so the engine's wait state falls through to the next boot
+  // step exactly as if the movie had finished.
+  if (name_is(id, "playMovie")) {
+    const char *path = next_str(va);
+    debugPrintf("JNI: playMovie('%s')\n", path ? path : "(null)");
+    movie_play(path);
+    return;
+  }
+  if (name_is(id, "stopMovie")) {
+    debugPrintf("JNI: stopMovie\n");
+    movie_stop();
+    return;
+  }
+  // Subtitle overlay for the movies -- the intros carry none, and the engine
+  // is happy for these to do nothing.
+  if (name_is(id, "setMovieText") || name_is(id, "clearMovieText") ||
+      name_is(id, "displayMovieText") || name_is(id, "setMovieTextScale")) {
+    return;
+  }
+
   // lifecycle / misc
   if (name_is(id, "finish") || name_is(id, "exitGame") || name_is(id, "quit") ||
       name_is(id, "QuitApp")) {
@@ -317,6 +341,11 @@ static juint hal_bool(const FakeID *id, va_list va) {
   // no Java splash, so it is never "visible"
   if (name_is(id, "isSplashScreenVisible"))
     return 0;
+
+  // Polled once per frame by OS_MovieIsPlaying while the boot state machine
+  // waits for an intro to finish.
+  if (name_is(id, "isMoviePlaying"))
+    return movie_is_playing() ? 1 : 0;
 
   // Switch is a console/TV device, not a phone (affects mobile UI scaling)
   if (name_is(id, "isPhone") || name_is(id, "isPhoneDevice"))
