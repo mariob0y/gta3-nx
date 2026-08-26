@@ -137,6 +137,14 @@ static const char *obj_str(void *jstr) {
 // lines. Backs STORAGE_ROOT and the engine's misc settings.
 // ---------------------------------------------------------------------------
 
+// Every engine file root hangs off this. The NRO runs with its own directory as
+// the working directory, so "." is /switch/gta3 -- readable for the shipped data
+// and writable for saves. OS_FileOpen builds user-data paths from it too, which
+// is why it is a function rather than a literal in two places.
+const char *jni_storage_root(void) {
+  return ".";
+}
+
 #define KV_MAX 256
 
 typedef struct {
@@ -365,7 +373,7 @@ static void *hal_object(const FakeID *id, va_list va) {
   if (name_is(id, "getAppLocalValue")) {
     const char *key = next_str(va);
     if (!strcmp(key, "STORAGE_ROOT") || !strcmp(key, "STORAGE_ROOT_BASE"))
-      return jni_make_string(".");
+      return jni_make_string(jni_storage_root());
     const char *v = kv_get(key);
     return jni_make_string(v ? v : "");
   }

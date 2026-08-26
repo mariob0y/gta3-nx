@@ -21,6 +21,10 @@
 #define LOG_NAME "gta3_log.txt"
 #define APPSTATE_NAME "appstate.txt"
 
+// Save slots go here rather than beside the NRO; gta3.set stays in the root.
+// Relative to the storage root, created on first write.
+#define USER_DATA_DIR "saves"
+
 // Enable debug log file writing and stdout printing (off for release)
 #define DEBUG_LOG 1
 

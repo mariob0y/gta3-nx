@@ -406,6 +406,120 @@ int NvFEOF_hook(void *h) {
   return feof(file->f);
 }
 
+// OSFileAccessType, read off the jump table the original OS_FileOpen builds at
+// .rodata 0xea7d4 in libGame.so:
+//   0 -> NvFOpen (read-only asset)     2 -> fopen "rb+", falling back to "wb+"
+//   1 -> fopen "wb"                    3 -> NvFOpen, streamed (CdStreamAddImage)
+// Only 0, 1 and 3 are reached in practice; 1 is what CFileMgr::OpenFile turns
+// any non-"r" mode string into, so it carries every save game and gta3.set.
+#define OS_ACCESS_READ   0
+#define OS_ACCESS_WRITE  1
+#define OS_ACCESS_RDWR   2
+#define OS_ACCESS_STREAM 3
+
+// OSFileDataArea: 1 is the user-data area. The original OS_FileOpen derives the
+// same predicate at 0x36d818 -- (area == 1) || (mode is write or read/write) --
+// and uses it to decide whether AND_NormalizePath prefixes StorageRootPath and
+// mkdir()s the directory. We replace OS_FileOpen outright, so that work has to
+// happen here; without it every write lands on a path nobody prepared.
+#define OS_AREA_USER 1
+
+static void os_build_path(const char *dir, const char *path, char *out, size_t out_len) {
+  const char *p = path;
+  if (p[0] == '.' && (p[1] == '/' || p[1] == '\\')) p += 2;
+  while (*p == '/' || *p == '\\') p++;
+
+  if (dir)
+    snprintf(out, out_len, "%s/%s/%s", jni_storage_root(), dir, p);
+  else
+    snprintf(out, out_len, "%s/%s", jni_storage_root(), p);
+  for (char *c = out; *c; c++)
+    if (*c == '\\') *c = '/';
+}
+
+// The settings file stays beside the NRO where it has always been; only the
+// save slots move into USER_DATA_DIR.
+static bool os_stays_in_root(const char *path) {
+  const char *name = path;
+  for (const char *c = path; *c; c++)
+    if (*c == '/' || *c == '\\') name = c + 1;
+  return strcasecmp(name, "gta3.set") == 0;
+}
+
+static void os_user_path(const char *path, char *out, size_t out_len) {
+  os_build_path(os_stays_in_root(path) ? NULL : USER_DATA_DIR, path, out, out_len);
+}
+
+// Where user data landed before it moved into USER_DATA_DIR. Reads fall back to
+// it so saves made by an earlier build still load, and deletes clear it so a
+// slot erased in the menu cannot reappear from here.
+static void os_legacy_user_path(const char *path, char *out, size_t out_len) {
+  os_build_path(NULL, path, out, out_len);
+}
+
+static void os_make_parent_dirs(char *path) {
+  for (char *c = strchr(path + 1, '/'); c; c = strchr(c + 1, '/')) {
+    *c = '\0';
+    mkdir(path, 0777);
+    *c = '/';
+  }
+}
+
+// Wrap an already-open stream in the handle the OS_File* hooks pass around.
+static int os_make_handle(void **out_handle, FILE *f, const char *full) {
+  OSFile *file = calloc(1, sizeof(OSFile));
+  if (!file) {
+    fclose(f);
+    *out_handle = NULL;
+    return 1;
+  }
+  file->f = f;
+  file->preload = NULL;
+  file->pos = 0;
+  file->is_world_stream = false;
+  snprintf(file->path, sizeof(file->path), "%s", full);
+
+  struct stat st;
+  file->size = (fstat(fileno(f), &st) == 0) ? st.st_size : 0;
+
+  *out_handle = file;
+  return 0;
+}
+
+static int os_file_open_write(void **out_handle, const char *path, int mode) {
+  char full[1024];
+  os_user_path(path, full, sizeof(full));
+  os_make_parent_dirs(full);
+
+  FILE *f = fopen(full, mode == OS_ACCESS_WRITE ? "wb" : "rb+");
+  if (!f && mode == OS_ACCESS_RDWR)
+    f = fopen(full, "wb+");
+  if (!f) {
+    LOGC(LOGC_FILE, "[OS_File] OS_FileOpen('%s') FAILED to open '%s' for writing\n", path, full);
+    *out_handle = NULL;
+    return 1;
+  }
+
+  LOGC(LOGC_FILE, "[OS_File] OS_FileOpen('%s') -> writable '%s'\n", path, full);
+  return os_make_handle(out_handle, f, full);
+}
+
+// Returns 0 on success; 1 means "not user data after all", so the caller should
+// let the ordinary asset lookup try the name.
+static int os_file_open_user_read(void **out_handle, const char *path) {
+  char full[1024];
+  os_user_path(path, full, sizeof(full));
+  FILE *f = fopen(full, "rb");
+  if (!f) {
+    os_legacy_user_path(path, full, sizeof(full));
+    f = fopen(full, "rb");
+  }
+  if (!f) return 1;
+
+  LOGC(LOGC_FILE, "[OS_File] OS_FileOpen('%s') -> user data '%s'\n", path, full);
+  return os_make_handle(out_handle, f, full);
+}
+
 static bool has_extension(const char *path, const char *ext) {
   if (!path || !ext) return false;
   size_t l1 = strlen(path), l2 = strlen(ext);
@@ -418,6 +532,12 @@ int OS_FileOpen_hook(int area, void **out_handle, const char *path, int mode) {
   if (!out_handle || !path) return 1;
   set_active_io_path(path);
   LOGC(LOGC_FILE, "[OS_File] OS_FileOpen(area=%d, path='%s', mode=%d, caller=%p)...\n", area, path, mode, caller);
+
+  if (mode == OS_ACCESS_WRITE || mode == OS_ACCESS_RDWR)
+    return os_file_open_write(out_handle, path, mode);
+
+  if (area == OS_AREA_USER && os_file_open_user_read(out_handle, path) == 0)
+    return 0;
 
   uint64_t t0 = io_tick_now();
   const char *resolved_path = path;
@@ -442,7 +562,7 @@ int OS_FileOpen_hook(int area, void **out_handle, const char *path, int mode) {
     }
   }
 
-  if (!f && path && (mode == 3 || mode == 2)) {
+  if (!f && path && mode == OS_ACCESS_STREAM) {
     LOGC(LOGC_FILE, "[OS_File] Stream file '%s' (mode=%d) missing! Fallback to 'MODELS/GTA3_DXT.IMG'...\n", path, mode);
     resolved_path = "MODELS/GTA3_DXT.IMG";
     f = open_asset_with_fallback(resolved_path);
@@ -724,14 +844,29 @@ int OS_FileFlush_hook(void *h) {
 
 int OS_FileRename_hook(int area, const char *oldpath, const char *newpath, bool b) {
   (void)area; (void)b;
-  debugPrintf("[OS_File] OS_FileRename('%s' -> '%s')\n", oldpath ? oldpath : "", newpath ? newpath : "");
-  return rename(oldpath, newpath);
+  if (!oldpath || !newpath) return -1;
+  char from[1024], to[1024];
+  os_user_path(oldpath, from, sizeof(from));
+  os_user_path(newpath, to, sizeof(to));
+  os_make_parent_dirs(to);
+  struct stat st;
+  if (stat(from, &st) != 0)
+    os_legacy_user_path(oldpath, from, sizeof(from));
+  debugPrintf("[OS_File] OS_FileRename('%s' -> '%s')\n", from, to);
+  return rename(from, to);
 }
 
 int OS_FileDelete_hook(int area, const char *path) {
   (void)area;
-  debugPrintf("[OS_File] OS_FileDelete('%s')\n", path ? path : "");
-  return remove(path);
+  if (!path) return -1;
+  char full[1024], legacy[1024];
+  os_user_path(path, full, sizeof(full));
+  os_legacy_user_path(path, legacy, sizeof(legacy));
+  debugPrintf("[OS_File] OS_FileDelete('%s')\n", full);
+  int rc = remove(full);
+  // Clear the pre-USER_DATA_DIR copy too, or the read fallback resurrects it.
+  if (remove(legacy) == 0) rc = 0;
+  return rc;
 }
 
 /* ============================================================================

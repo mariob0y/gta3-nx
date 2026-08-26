@@ -23,6 +23,8 @@ extern volatile int jni_frontend_ready;
 
 void jni_init(void);
 
+const char *jni_storage_root(void);
+
 typedef enum {
   JNI_CB_PLAYLIST_OPEN_COMPLETE = 1,
   JNI_CB_ROCKSTAR_INITIAL_COMPLETE,
