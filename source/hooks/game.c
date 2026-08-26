@@ -18,6 +18,8 @@
 #include <GLES2/gl2.h>
 
 #include <sys/stat.h>
+#include <unistd.h>
+#include <errno.h>
 
 #include "../config.h"
 #include "../util.h"
@@ -230,6 +232,8 @@ typedef struct {
   long size;
   bool is_world_stream;
   char path[128];
+  bool pending_rename;
+  char tmp_path[300];
 } NvFile;
 
 typedef NvFile OSFile;
@@ -491,8 +495,35 @@ static int os_file_open_write(void **out_handle, const char *path, int mode) {
   os_user_path(path, full, sizeof(full));
   os_make_parent_dirs(full);
 
-  FILE *f = fopen(full, mode == OS_ACCESS_WRITE ? "wb" : "rb+");
-  if (!f && mode == OS_ACCESS_RDWR)
+  if (mode == OS_ACCESS_WRITE) {
+    // Plain fopen(full, "wb") truncates the existing save the instant it's
+    // opened. CFileMgr's save sequence writes several files per slot, and if
+    // the process dies mid-write -- sleep, HOME-menu kill, power loss -- the
+    // slot is left with a zero-length or half-written file and the old save
+    // is already gone. Write to a temp sibling and rename over the target on
+    // close instead, so a save is atomic: either the old file or the fully
+    // written new one, never a partial one.
+    char tmp[300];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", full);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) {
+      LOGC(LOGC_FILE, "[OS_File] OS_FileOpen('%s') FAILED to open '%s' for writing\n", path, tmp);
+      *out_handle = NULL;
+      return 1;
+    }
+
+    LOGC(LOGC_FILE, "[OS_File] OS_FileOpen('%s') -> writable (atomic) '%s'\n", path, full);
+    int rc = os_make_handle(out_handle, f, full);
+    if (rc == 0) {
+      NvFile *file = (NvFile *)*out_handle;
+      file->pending_rename = true;
+      snprintf(file->tmp_path, sizeof(file->tmp_path), "%s", tmp);
+    }
+    return rc;
+  }
+
+  FILE *f = fopen(full, "rb+");
+  if (!f)
     f = fopen(full, "wb+");
   if (!f) {
     LOGC(LOGC_FILE, "[OS_File] OS_FileOpen('%s') FAILED to open '%s' for writing\n", path, full);
@@ -644,7 +675,21 @@ int OS_FileClose_hook(void *h) {
     return 0;
   }
   sc_close(file);
-  if (file->f) fclose(file->f);
+  if (file->f) {
+    if (file->pending_rename) {
+      fflush(file->f);
+      fsync(fileno(file->f));
+    }
+    fclose(file->f);
+  }
+  if (file->pending_rename) {
+    if (rename(file->tmp_path, file->path) != 0) {
+      LOGC(LOGC_FILE, "[OS_File] OS_FileClose: FAILED to rename '%s' -> '%s' (errno=%d)\n",
+           file->tmp_path, file->path, errno);
+    } else {
+      LOGC(LOGC_FILE, "[OS_File] OS_FileClose: committed '%s'\n", file->path);
+    }
+  }
   free(file);
   return 0;
 }
