@@ -624,7 +624,7 @@ bool movie_play(const char *engine_path) {
 
   /* Decoding competes with the engine's own boot work; hold the clock up for
    * the length of the movie so neither starves. */
-  cpu_boost(1);
+  cpu_boost_acquire("intro_movie");
   return true;
 }
 
@@ -645,7 +645,7 @@ void movie_stop(void) {
   mv_free_planes(m);
   pthread_mutex_unlock(&g_mv_lock);
 
-  cpu_boost(0);
+  cpu_boost_release("intro_movie");
 }
 
 /* ------------------------------------------------------------------------- *

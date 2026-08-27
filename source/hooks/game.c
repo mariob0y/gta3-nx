@@ -812,7 +812,10 @@ void set_stream_runtime_mode(StreamingRuntimeMode mode, unsigned grace_frames) {
 }
 
 void process_gradual_prewarm_queue(void);
+static void log_preload_feasibility_survey(void);
+static void run_one_time_txd_preload(void);
 static void run_one_time_area_preload(void);
+static bool prewarm_seed_batch_drained(void);
 
 void update_streaming_transition_frame(void) {
   unsigned rem = atomic_load_explicit(&g_stream_transition_frames, memory_order_relaxed);
@@ -2958,7 +2961,17 @@ void process_gradual_prewarm_queue(void) {
   // PREWARM_LATE despite being in kKnownHeavySeeds, because CTheScripts
   // fired its own (position-independent) REQUEST_MODEL calls for them
   // almost immediately after the grid preload finally returned control.
-  run_one_time_area_preload(); // no-ops after its first successful run
+  // Measurement only, runs once: prints what a whole-map pre-instantiation
+  // would cost against the streaming budget. Nothing here requests, loads or
+  // removes anything -- see log_preload_feasibility_survey.
+  log_preload_feasibility_survey();
+  // Runs before the grid: every TXD the grid's LoadScene calls would have
+  // faulted in one at a time is already resident by the time it starts.
+  run_one_time_txd_preload();      // no-ops after its first run
+  /* The grid belongs to the full_preload=0 path only. With every dictionary
+   * preloaded it is pure cost: LoadScene purges the loaded list and calls
+   * DeleteAllRwObjects before loading, so nine calls largely undo each other. */
+  if (!config.full_preload) run_one_time_area_preload();
 }
 
 static void wrap_CStreaming_Init(void) {
@@ -3022,34 +3035,40 @@ static void wrap_LoadScene(const void *pos) {
        streaming_context_to_string(ctx), stream_runtime_mode_to_string(mode), gp_enabled ? 1 : 0, g_load_scene_depth, caller);
 
   STREAM_SCOPE_ENTER("LoadScene", ", ctx=%d, depth=%d", ctx, g_load_scene_depth);
+  /* This is the engine's real loading screen, and the only one this build has.
+   * The JNI showSplashScreen/hideSplashScreen pair would have been the obvious
+   * place to hold the clock, but the engine never calls either in this port --
+   * zero occurrences across a full session log -- so the 7.4s the engine spends
+   * loading the world before our own preload even starts was running at the
+   * normal clock.
+   *
+   * LoadScene covers starting a new game, loading a save, and island
+   * transitions. It blocks while it runs, so nothing is being presented and
+   * FastLoad's GPU throttle costs nothing. The reference is counted, so nesting
+   * with the TXD preload or anything else is safe. */
+  cpu_boost_acquire("load_scene");
   if (orig_LoadScene) orig_LoadScene(pos);
+  cpu_boost_release("load_scene");
   STREAM_SCOPE_EXIT("LoadScene");
   g_load_scene_depth--;
 }
 
-/* One-time area-preload experiment: force-load a grid of points around the
- * player's spawn position using the same CStreaming::LoadScene() the game
- * itself uses for synchronous area loads (teleports, etc.) -- reusing it
- * rather than inventing our own request-and-wait loop, since it's already
- * proven to correctly load an area.
+/* ---------------------------------------------------------------------------
+ * The 3x3 LoadScene area-preload grid, kept for config.full_preload == 0.
  *
- * History: 3x3/400-unit (800x800 span) proved the mechanism cleanly (82
- * overshoot events, minimal thrashing) -- this remains the best verified
- * result. 7x7/500-unit (3000x3000 span) regressed badly: not from a bug,
- * but from genuinely exceeding available capacity -- even after fixing
- * unbounded reactive pinning (see pin_model_bounded), the deadlock-breaker
- * still fired 1300+ times, concentrated on a handful of models getting
- * evicted and immediately re-needed over and over. 5x5/500-unit (2000x2000
- * span), tested as a deliberate middle point with both the pin cap AND the
- * raised memory ceiling active, still showed real (if smaller) thrashing
- * (356 firings, 97 overshoot vs 3x3's 82) -- confirming the capacity wall
- * scales roughly with area rather than being a sudden cliff at 7x7, and
- * that no size between 3x3 and 7x7 comes out ahead of 3x3 with this
- * bulk-preload-and-hold-forever strategy. Settled back on 3x3 as the
- * production size. The pin cap and raised memory ceiling stay regardless
- * (durable fixes, not grid-specific). Going bigger than this needs a
- * different strategy entirely -- see the CWorld-sector-walk predictive
- * discovery direction, not a repeat of this bulk-preload approach. */
+ * It is genuinely counterproductive alongside a full preload: LoadScene
+ * (0x2bb1a4) walks the loaded list and RemoveModel()s every entry whose flags
+ * miss "tst w9, #0xf", then calls DeleteAllRwObjects(), and only then requests
+ * around the new point -- so nine calls spend much of their time destroying
+ * what the previous eight built. Its cost fell from 4088ms to 2102ms once the
+ * TXD preload made textures resident ahead of it, which says it was mostly
+ * faulting in what the preload now handles.
+ *
+ * It stays because full_preload=0 is meant to reproduce the configuration that
+ * was measured on hardware (~30s load, 1.09s of gameplay stalls), and that
+ * configuration included this grid. Changing both at once would make that
+ * fallback something nobody has actually tested.
+ * ------------------------------------------------------------------------- */
 #define AREA_PRELOAD_GRID_SIZE 3
 #define AREA_PRELOAD_SPACING 400.0f
 static bool g_area_preload_done = false;
@@ -3075,10 +3094,7 @@ static void run_one_time_area_preload(void) {
   // everything it needed. Scope the gate to ONLY the fixed seed batch
   // (g_prewarm_candidates[0..g_num_seeded_candidates)), which is what
   // actually needs to drain before CTheScripts' early trigger point.
-  for (size_t i = 0; i < g_num_seeded_candidates; i++) {
-    PrewarmCandidate *c = &g_prewarm_candidates[i];
-    if (c->status == CANDIDATE_QUEUED || c->status == CANDIDATE_FREE) return; // still waiting, retry next call
-  }
+  if (!prewarm_seed_batch_drained()) return; // still waiting, retry next call
 
   g_area_preload_done = true;
 
@@ -3103,6 +3119,13 @@ static void run_one_time_area_preload(void) {
        AREA_PRELOAD_GRID_SIZE, AREA_PRELOAD_GRID_SIZE, AREA_PRELOAD_SPACING, span, span,
        center.x, center.y, center.z, g_frame_count);
 
+  /* Boosted for the same reason the TXD preload is, and it needs its own
+   * reference for the same reason: this runs at frame 646 against a gameplay
+   * transition at 645, so main()'s pre_gameplay reference has already been
+   * released by the time we get here. Nine blocking LoadScene calls measured
+   * 4811ms unboosted, with the player nominally in control while they run. */
+  cpu_boost_acquire("area_grid");
+
   uint64_t t0 = armGetSystemTick();
   int calls = 0;
   double running_ms = 0.0;
@@ -3125,9 +3148,421 @@ static void run_one_time_area_preload(void) {
     }
   }
   double total_ms = (double)armTicksToNs(armGetSystemTick() - t0) / 1e6;
+  cpu_boost_release("area_grid");
   LOGC(LOGC_SYS, "[AREA_PRELOAD] Completed %d LoadScene calls in %.1fms (%.2fs), frame #%u\n",
        calls, total_ms, total_ms / 1000.0, g_frame_count);
 }
+
+/* ---------------------------------------------------------------------------
+ * Whole-map pre-instantiation feasibility survey (MEASUREMENT ONLY)
+ *
+ * Answers, with real numbers off the running console rather than an estimate,
+ * the question that decides whether "preload everything during the loading
+ * screen" is viable at all: how much streaming memory would a fully resident
+ * map actually charge to CStreaming, and does that fit under the budget?
+ *
+ * Every layout constant below was read out of this libGame.so, not re3:
+ *
+ *   CPools::Initialise (0x2233f0) builds each pool as a 24-byte header --
+ *   { void *entries; int8 *flags; int32 size; int32 allocPtr; } -- with the
+ *   storage and the flag byte array as two separate new[] calls. Sizes it
+ *   passes: building 5500 x 128, treadable 1214 x 176, dummy 2802 x 144,
+ *   ped 140 x 1944, vehicle 110 x 1728, object 500 x 552, ptrNode 30000 x 24,
+ *   entryInfoNode 5400 x 40, audioScriptObject 256 x 20. None of those are
+ *   allocated by streaming a model in, so a preload cannot overflow them --
+ *   which is what makes this approach worth measuring at all.
+ *
+ *   CStreaming::RequestAllModels (0x2b87f4) walks exactly three of those --
+ *   building (stride 128), treadable (176), dummy (144), reached through the
+ *   GOT slots that objdump -R names ms_pBuildingPool / ms_pTreadablePool /
+ *   ms_pDummyPool -- skips any slot whose flag byte is negative (bit 7 set =
+ *   free), reads a SIGNED int16 model index at entity+112, and calls
+ *   RequestModel(index, 0). So the set it would request is precisely the
+ *   distinct model indices of every live building, treadable and dummy.
+ *
+ *   CStreamingInfo is 32 bytes: m_loadState u8 @16, m_flags u8 @17,
+ *   m_offset u32 @20, m_size u32 @24 (GetCdSize at 0x2b4390 returns [x0,#24]).
+ *   m_size is in 2048-byte CD sectors: CStreaming::RemoveModel (0x2b7124)
+ *   does "sub w8, w10, w8, lsl #11" -- ms_memoryUsed -= m_size * 2048 -- so
+ *   summing m_size * 2048 predicts ms_memoryUsed at full residency directly,
+ *   in the same units the eviction test uses.
+ *
+ *   CStreaming::MakeSpaceFor (0x2ba6b8) is that eviction test, and it compares
+ *   in exactly those units: while (ms_memoryUsed >= ms_memoryAvailable - want)
+ *   RemoveLeastUsedModel(). Which is why the verdict below is a straight
+ *   comparison of the projected total against ms_memoryAvailable.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+  void    *entries;
+  int8_t  *flags;
+  int32_t  size;
+  int32_t  allocPtr;
+} EnginePool;
+
+#define POOL_FLAG_SLOT_FREE      0x80  /* bit 7; RequestAllModels tests it via ldrsb + tbnz #31 */
+#define ENTITY_OFF_MODELINDEX    112   /* signed int16 */
+#define STREAMINFO_STRIDE        32
+#define STREAMINFO_OFF_LOADSTATE 16
+#define STREAMINFO_OFF_SIZE      24
+#define CDSTREAM_SECTOR_SIZE     2048
+#define NUM_TXD_SLOTS            (NUMSTREAMINFO - STREAM_OFFSET_TXD)
+
+static bool g_preload_survey_done = false;
+
+/* One streaming slot's CD size in bytes. Reads 0 for a slot with no CD entry,
+ * which is how unused slots read. */
+static inline uint64_t streaminfo_size_bytes(const uint8_t *info_base, int idx) {
+  const uint8_t *e = info_base + (size_t)idx * STREAMINFO_STRIDE;
+  uint32_t sectors;
+  memcpy(&sectors, e + STREAMINFO_OFF_SIZE, sizeof(sectors));
+  return (uint64_t)sectors * CDSTREAM_SECTOR_SIZE;
+}
+
+static inline uint8_t streaminfo_load_state(const uint8_t *info_base, int idx) {
+  return info_base[(size_t)idx * STREAMINFO_STRIDE + STREAMINFO_OFF_LOADSTATE];
+}
+
+/* Marks one pool's live entities' model indices in seen[], returning the number
+ * of occupied slots inspected. Every index is bounded against MODELINFO_COUNT
+ * before use: the field is a signed int16 and nothing guarantees a live-flagged
+ * slot holds a sane one. */
+static int survey_mark_pool_models(const EnginePool *pool, size_t stride,
+                                   uint8_t *seen, int *out_distinct) {
+  int live = 0;
+  if (!pool || !pool->entries || !pool->flags || pool->size <= 0) return 0;
+  for (int i = 0; i < pool->size; i++) {
+    if (pool->flags[i] & POOL_FLAG_SLOT_FREE) continue;
+    live++;
+    const uint8_t *ent = (const uint8_t *)pool->entries + (size_t)i * stride;
+    int16_t model;
+    memcpy(&model, ent + ENTITY_OFF_MODELINDEX, sizeof(model));
+    if (model < 0 || model >= MODELINFO_COUNT) continue;
+    if (!seen[model]) { seen[model] = 1; (*out_distinct)++; }
+  }
+  return live;
+}
+
+static void log_preload_feasibility_survey(void) {
+  if (g_preload_survey_done) return;
+
+  const uint8_t *info = g_pCStreaming_ms_aInfoForModel;
+  if (!info) {
+    info = (const uint8_t *)so_try_find_addr_rx(&game_mod, "_ZN10CStreaming16ms_aInfoForModelE");
+    if (!info) return; /* nothing resolvable yet -- retry on the next call */
+  }
+
+  EnginePool **pp_building  = (EnginePool **)so_try_find_addr_rx(&game_mod, "_ZN6CPools16ms_pBuildingPoolE");
+  EnginePool **pp_treadable = (EnginePool **)so_try_find_addr_rx(&game_mod, "_ZN6CPools17ms_pTreadablePoolE");
+  EnginePool **pp_dummy     = (EnginePool **)so_try_find_addr_rx(&game_mod, "_ZN6CPools13ms_pDummyPoolE");
+  void **modelinfo_ptrs     = (void **)so_try_find_addr_rx(&game_mod, "_ZN10CModelInfo16ms_modelInfoPtrsE");
+  int *p_mem_used           = (int *)so_try_find_addr_rx(&game_mod, "_ZN10CStreaming13ms_memoryUsedE");
+  int *p_mem_avail          = (int *)so_try_find_addr_rx(&game_mod, "_ZN10CStreaming18ms_memoryAvailableE");
+
+  if (!pp_building || !*pp_building || !modelinfo_ptrs) return;
+  /* The pools exist from CPools::Initialise but only fill once the IPLs load.
+   * Surveying an empty building pool would record a meaningless zero, so wait
+   * for it instead. */
+  if ((*pp_building)->size <= 0 || (*pp_building)->allocPtr <= 0) return;
+
+  g_preload_survey_done = true;
+
+  static uint8_t seen_model[MODELINFO_COUNT];
+  static uint8_t seen_txd[NUM_TXD_SLOTS];
+  memset(seen_model, 0, sizeof(seen_model));
+  memset(seen_txd, 0, sizeof(seen_txd));
+
+  /* ---- 1. The whole CD directory, as the absolute upper bound ---- */
+  uint64_t cd_model_bytes = 0, cd_txd_bytes = 0;
+  int cd_models = 0, cd_txds = 0;
+  uint64_t resident_bytes = 0;
+  int resident_count = 0;
+  for (int i = 0; i < NUMSTREAMINFO; i++) {
+    uint64_t b = streaminfo_size_bytes(info, i);
+    if (b == 0) continue;
+    if (i < STREAM_OFFSET_TXD) { cd_models++; cd_model_bytes += b; }
+    else                       { cd_txds++;   cd_txd_bytes   += b; }
+    if (streaminfo_load_state(info, i) == 1) { resident_count++; resident_bytes += b; }
+  }
+
+  /* ---- 2. What CStreaming::RequestAllModels would actually request ---- */
+  int distinct_models = 0;
+  int live_buildings  = survey_mark_pool_models(*pp_building, 128, seen_model, &distinct_models);
+  int live_treadables = (pp_treadable && *pp_treadable)
+                      ? survey_mark_pool_models(*pp_treadable, 176, seen_model, &distinct_models) : 0;
+  int live_dummies    = (pp_dummy && *pp_dummy)
+                      ? survey_mark_pool_models(*pp_dummy, 144, seen_model, &distinct_models) : 0;
+
+  uint64_t req_model_bytes = 0;
+  int distinct_txds = 0;
+  for (int m = 0; m < MODELINFO_COUNT; m++) {
+    if (!seen_model[m]) continue;
+    req_model_bytes += streaminfo_size_bytes(info, m);
+    const uint8_t *mi = (const uint8_t *)modelinfo_ptrs[m];
+    if (!mi) continue;
+    int16_t txd;
+    memcpy(&txd, mi + CMODELINFO_OFF_TXDINDEX, sizeof(txd)); /* SIGNED; -1 = none */
+    if (txd < 0 || txd >= NUM_TXD_SLOTS) continue;
+    if (!seen_txd[txd]) { seen_txd[txd] = 1; distinct_txds++; }
+  }
+  uint64_t req_txd_bytes = 0;
+  for (int t = 0; t < NUM_TXD_SLOTS; t++) {
+    if (seen_txd[t]) req_txd_bytes += streaminfo_size_bytes(info, STREAM_OFFSET_TXD + t);
+  }
+
+  const double MB = 1024.0 * 1024.0;
+  uint64_t req_total = req_model_bytes + req_txd_bytes;
+  uint64_t cd_total  = cd_model_bytes + cd_txd_bytes;
+  int mem_avail = p_mem_avail ? *p_mem_avail : 0;
+  int mem_used  = p_mem_used  ? *p_mem_used  : 0;
+
+  LOGC(LOGC_SYS, "[PRELOAD_SURVEY] cd_directory: models=%d (%.1f MB) txds=%d (%.1f MB) total=%.1f MB\n",
+       cd_models, cd_model_bytes / MB, cd_txds, cd_txd_bytes / MB, cd_total / MB);
+  LOGC(LOGC_SYS, "[PRELOAD_SURVEY] pools: building=%d/%d treadable=%d/%d dummy=%d/%d (live/capacity)\n",
+       live_buildings, (*pp_building)->size,
+       live_treadables, (pp_treadable && *pp_treadable) ? (*pp_treadable)->size : 0,
+       live_dummies, (pp_dummy && *pp_dummy) ? (*pp_dummy)->size : 0);
+  LOGC(LOGC_SYS, "[PRELOAD_SURVEY] request_all_models: distinct_models=%d (%.1f MB) distinct_txds=%d (%.1f MB) total=%.1f MB\n",
+       distinct_models, req_model_bytes / MB, distinct_txds, req_txd_bytes / MB, req_total / MB);
+  LOGC(LOGC_SYS, "[PRELOAD_SURVEY] resident_now: %d slots (%.1f MB) | ms_memoryUsed=%.1f MB ms_memoryAvailable=%.1f MB\n",
+       resident_count, resident_bytes / MB, mem_used / MB, mem_avail / MB);
+  LOGC(LOGC_SYS, "[PRELOAD_SURVEY] verdict: whole_map=%.1f MB vs budget=%.1f MB -> %s (headroom %.1f MB) | whole_cd=%.1f MB -> %s\n",
+       req_total / MB, mem_avail / MB,
+       ((uint64_t)mem_avail > req_total) ? "FITS" : "OVERFLOWS",
+       ((double)mem_avail - (double)req_total) / MB,
+       cd_total / MB,
+       ((uint64_t)mem_avail > cd_total) ? "FITS" : "OVERFLOWS");
+}
+
+
+/* True once every FIXED seed candidate has been requested, i.e. none is still
+ * sitting in QUEUED/FREE. The TXD preload gates on this moment: late enough
+ * that the
+ * seeded batch is not starved, early enough to beat CTheScripts' first
+ * REQUEST_MODEL calls. Deliberately scoped to the seed batch rather than the
+ * whole candidate table -- reactive candidates keep getting appended as the
+ * game runs, so the table never empties and a gate on it never fires. */
+static bool prewarm_seed_batch_drained(void) {
+  for (size_t i = 0; i < g_num_seeded_candidates; i++) {
+    const PrewarmCandidate *c = &g_prewarm_candidates[i];
+    if (c->status == CANDIDATE_QUEUED || c->status == CANDIDATE_FREE) return false;
+  }
+  return true;
+}
+
+/* ---------------------------------------------------------------------------
+ * Whole-map TXD pre-instantiation
+ *
+ * Measured on hardware ([PRELOAD_SURVEY] plus the spike attribution in the same
+ * log), the case for doing TXDs and only TXDs:
+ *
+ *   - Of 67 gameplay spikes, 56 name a streaming index >= STREAM_OFFSET_TXD.
+ *     They account for 4.24s of the 4.25s of gameplay streaming time. Models
+ *     contribute 0.01s. The stutter is texture dictionaries, essentially
+ *     nothing else.
+ *   - Every TXD in the game is 68.1 MB of streaming budget (719 slots with a CD
+ *     entry); the 384 the static map actually references are 51.0 MB. Against
+ *     ms_memoryAvailable = 2000 MB. Residency is simply not a constraint.
+ *   - The survey's own arithmetic was cross-checked against the engine: our
+ *     computed resident total and ms_memoryUsed agreed exactly (38.3 MB), so
+ *     m_size * 2048 is the same unit CStreaming charges itself.
+ *
+ * Why the preloaded TXDs then stay resident, all verified by disassembly:
+ *
+ *   - CStreaming::RemoveLeastUsedModel (0x2b8b74) skips any entry whose flags
+ *     hit "tst w10, #0x3", so STREAMFLAGS_DONT_REMOVE is enough to be passed
+ *     over -- and at 68 MB of 2000 MB, MakeSpaceFor (0x2ba6b8) never enters its
+ *     eviction loop in the first place.
+ *   - CStreaming::LoadScene (0x2bb1a4) purges the loaded list before it loads
+ *     anything, but skips entries matching "tst w9, #0xf", which includes
+ *     DONT_REMOVE. So the area-preload grid below cannot undo this.
+ *   - CStreaming::RemoveNonReferencedTxds (0x2b9c74) WOULD ignore those flags
+ *     and drop any TXD with no CTxdStore refs -- exactly what a preloaded TXD
+ *     looks like -- but it has no callers anywhere in libGame.so. Neither does
+ *     RequestAllModels. Both are dead exports in this build.
+ *
+ * The requests are issued in batches with a blocking drain after each, rather
+ * than all 719 followed by one drain, so the work is punctuated and its cost
+ * is visible per batch in the log instead of as one opaque stall.
+ * ------------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------------
+ * TXD preloading
+ *
+ * Two behaviours, chosen by config.full_preload, with nothing in between:
+ *
+ *   1 -- instantiate every texture dictionary in the game before gameplay
+ *        starts, and skip the 3x3 LoadScene grid.
+ *   0 -- do nothing here at all; the engine streams as it always did.
+ *
+ * Measured on hardware, same build, same route, stalls per 1000 gameplay
+ * frames:
+ *
+ *   full_preload=0        ~13s load    2765ms
+ *   full_preload=1        ~25s load     222ms   (~40s without the CPU boost)
+ *
+ * Preloading is a roughly 1:1 conversion of gameplay stall into loading time,
+ * because texture instantiation is priced per upload CALL and happens on the
+ * main thread inside the engine's own update, where it cannot be subdivided.
+ * No scheduling trick removes that work -- an attempt to spread it across
+ * gameplay frames simply converted the loading wall into 30.7s of stutter.
+ *
+ * A usage-profile mode used to live here, preloading only the dictionaries a
+ * player's own routes had touched. It worked (~14s load, 367ms) but it was a
+ * third behaviour to reason about, it only ever grew, and it converged on the
+ * full preload anyway. Removed deliberately; do not reintroduce it without a
+ * reason the two endpoints above do not already cover.
+ * ------------------------------------------------------------------------- */
+
+#define STREAMFLAGS_DONT_REMOVE 0x01
+#define TXD_PRELOAD_BATCH 32
+/* A safety stop, not a target: frame-rate stability is what this optimises.
+ * The full set measures ~19s boosted, so this only exists so a bad data set
+ * cannot hang the console indefinitely. */
+#define TXD_PRELOAD_BUDGET_MS 60000.0
+
+/* One preload candidate: a TXD streaming slot and its CD size. */
+typedef struct {
+  int32_t  index;    /* streaming index, i.e. STREAM_OFFSET_TXD + slot */
+  uint32_t bytes;    /* CD size, m_size * 2048 */
+} TxdPreloadCandidate;
+
+/* Ascending by size, cheapest first, so a budget cut-off loses the least.
+ *
+ * Descending was tried and is measurably worse: cost is per upload CALL rather
+ * than per byte, so a dictionary's cost tracks how many textures it holds, and
+ * biggest-first spent an entire 12s budget on 56 of 604 dictionaries (9%),
+ * leaving 2.88s of gameplay stalls where index order's 384 (64%) left 0.14s.
+ * Do not reintroduce a descending sort. */
+static int txd_candidate_cmp_asc(const void *a, const void *b) {
+  uint32_t ba = ((const TxdPreloadCandidate *)a)->bytes;
+  uint32_t bb = ((const TxdPreloadCandidate *)b)->bytes;
+  if (ba < bb) return -1;
+  if (ba > bb) return 1;
+  return 0;
+}
+
+static TxdPreloadCandidate g_txd_candidates[NUM_TXD_SLOTS];
+static int      g_txd_num_candidates = 0;
+static int      g_txd_cursor = 0;
+static uint64_t g_txd_candidate_bytes = 0;
+static uint64_t g_txd_covered_bytes = 0;
+static bool     g_txd_scan_done = false;
+static bool     g_txd_preload_complete = false;
+
+static void run_one_time_txd_preload(void) {
+  if (g_txd_preload_complete) return;
+  if (!config.full_preload) {
+    g_txd_preload_complete = true;
+    LOGC(LOGC_SYS, "[TXD_PRELOAD] Disabled (full_preload=0) -- the engine streams normally (frame #%u)\n",
+         g_frame_count);
+    return;
+  }
+  if (!prewarm_seed_batch_drained()) return; // still waiting, retry next call
+
+  const uint8_t *info = g_pCStreaming_ms_aInfoForModel;
+  if (!real_RequestModel) {
+    real_RequestModel = (Func_RequestModel)so_try_find_addr_rx(&game_mod, "_ZN10CStreaming12RequestModelEii");
+  }
+  if (!info || !real_RequestModel || !orig_LoadAllRequestedModels) {
+    g_txd_preload_complete = true; /* nothing to retry -- these never appear later */
+    LOGC(LOGC_SYS, "[TXD_PRELOAD] Skipped: info=%p RequestModel=%p LoadAll=%p (frame #%u)\n",
+         (const void *)info, (void *)real_RequestModel,
+         (void *)orig_LoadAllRequestedModels, g_frame_count);
+    return;
+  }
+
+  int *p_mem_used = (int *)so_try_find_addr_rx(&game_mod, "_ZN10CStreaming13ms_memoryUsedE");
+  const double MB = 1024.0 * 1024.0;
+
+  if (!g_txd_scan_done) {
+    g_txd_scan_done = true;
+    int skipped_resident = 0, skipped_no_cd = 0;
+    for (int slot = 0; slot < NUM_TXD_SLOTS; slot++) {
+      int idx = STREAM_OFFSET_TXD + slot;
+      uint64_t bytes = streaminfo_size_bytes(info, idx);
+      if (bytes == 0) { skipped_no_cd++; continue; }
+      if (streaminfo_load_state(info, idx) == 1) { skipped_resident++; continue; }
+      g_txd_candidates[g_txd_num_candidates].index = idx;
+      g_txd_candidates[g_txd_num_candidates].bytes = (uint32_t)bytes;
+      g_txd_num_candidates++;
+      g_txd_candidate_bytes += bytes;
+    }
+    qsort(g_txd_candidates, (size_t)g_txd_num_candidates, sizeof(g_txd_candidates[0]),
+          txd_candidate_cmp_asc);
+
+    LOGC(LOGC_SYS, "[TXD_PRELOAD] Loading every dictionary: %d to load (%.1f MB), %d already resident, %d without a CD entry; budget=%.0fms ms_memoryUsed=%.1f MB (frame #%u)\n",
+         g_txd_num_candidates, g_txd_candidate_bytes / MB,
+         skipped_resident, skipped_no_cd, TXD_PRELOAD_BUDGET_MS,
+         p_mem_used ? *p_mem_used / MB : 0.0, g_frame_count);
+
+    if (g_txd_num_candidates == 0) {
+      g_txd_preload_complete = true;
+      LOGC(LOGC_SYS, "[TXD_PRELOAD] Nothing to load -- everything is already resident (frame #%u)\n",
+           g_frame_count);
+      return;
+    }
+  }
+
+  /* The forced drain is correct HERE and nowhere else. On the loading screen
+   * nothing else is queued, so LoadAllRequestedModels only pulls in what we
+   * just asked for. The same call during gameplay was a real bug: it flushes
+   * the channels and drains the entire request list, dragging the engine's own
+   * player-relevant streaming through synchronously -- measured at 71ms/frame
+   * against a 6ms budget, roughly 1 fps. Do not move this. */
+  g_txd_preload_complete = true;
+  /* Its own boost reference, NOT covered by main()'s pre_gameplay one.
+   * This function is gated on prewarm_seed_batch_drained(), which does not
+   * fire until after the gameplay transition -- measured: the transition logs
+   * at frame 645 and this runs at frame 646, well after pre_gameplay has been
+   * released. The clock is back to Normal by the time we get here. */
+  cpu_boost_acquire("txd_preload");
+
+  uint64_t t0 = armGetSystemTick();
+  int pending = 0, batches = 0;
+  double elapsed_ms = 0.0;
+  bool budget_hit = false;
+
+  for (int c = 0; c < g_txd_num_candidates; c++) {
+    real_RequestModel(g_txd_candidates[c].index, STREAMFLAGS_DONT_REMOVE);
+    g_txd_covered_bytes += g_txd_candidates[c].bytes;
+    g_txd_cursor++;
+    pending++;
+
+    if (pending >= TXD_PRELOAD_BATCH) {
+      orig_LoadAllRequestedModels(false);
+      pending = 0;
+      batches++;
+      elapsed_ms = (double)armTicksToNs(armGetSystemTick() - t0) / 1e6;
+      if (elapsed_ms > TXD_PRELOAD_BUDGET_MS) { budget_hit = true; break; }
+    }
+  }
+  if (pending > 0) {
+    orig_LoadAllRequestedModels(false);
+    batches++;
+  }
+  elapsed_ms = (double)armTicksToNs(armGetSystemTick() - t0) / 1e6;
+  cpu_boost_release("txd_preload");
+
+  int resident_txds = 0;
+  uint64_t resident_bytes = 0;
+  for (int t = 0; t < NUM_TXD_SLOTS; t++) {
+    int idx = STREAM_OFFSET_TXD + t;
+    if (streaminfo_load_state(info, idx) == 1) {
+      resident_txds++;
+      resident_bytes += streaminfo_size_bytes(info, idx);
+    }
+  }
+
+  LOGC(LOGC_SYS, "[TXD_PRELOAD] Completed in %.1fms (%.2fs): loaded %d/%d dictionaries (%.1f/%.1f MB) in %d batches, budget_hit=%d (frame #%u)\n",
+       elapsed_ms, elapsed_ms / 1000.0, g_txd_cursor, g_txd_num_candidates,
+       g_txd_covered_bytes / MB, g_txd_candidate_bytes / MB, batches,
+       budget_hit ? 1 : 0, g_frame_count);
+  LOGC(LOGC_SYS, "[TXD_PRELOAD] Result: %d/%d TXD slots resident (%.1f MB) | ms_memoryUsed=%.1f MB\n",
+       resident_txds, NUM_TXD_SLOTS, resident_bytes / MB,
+       p_mem_used ? *p_mem_used / MB : 0.0);
+}
+
 
 void emit_and_reset_frame_streaming_summary(double total_frame_ms) {
   int models = atomic_load_explicit(&g_models_loaded_this_frame, memory_order_relaxed);

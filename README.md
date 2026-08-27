@@ -144,6 +144,7 @@ the performance overlay. Any face or shoulder button skips an intro movie.
 | `streaming_budget_ms` | `5.0` | per-frame time budget for streaming work |
 | `show_fps_overlay` | `0` | on-screen FPS / frame-time / freeze counter, plus resolution and dock state (top-left) |
 | `intro_movies` | `1` | play the Rockstar logo and title movies at boot; `0` skips straight to the menu |
+| `full_preload` | `0` | `1` = instantiate every texture dictionary before gameplay (longer load time, less stutter); `0` = stream normally |
 | `debug_log_enabled` | `0` | write `gta3_log.txt` to the SD card |
 | `log_mask` | `0x...` | bitmask of log categories, only meaningful with logging on |
 

@@ -106,7 +106,24 @@ void emit_and_reset_frame_streaming_summary(double total_frame_ms);
 void print_crash_snapshot(int sig);
 
 // CPU clock boost mode toggle
-void cpu_boost(int on);
+/* Reference-counted CPU boost.
+ *
+ * FastLoad is the strongest setting the application API offers -- there is no
+ * frequency parameter, only ApmCpuBoostMode_{Normal,FastLoad,Type2}, and
+ * appletSetCpuBoostMode accepts 0 or 1 only. FastLoad also throttles the GPU to
+ * minimum, which is why it belongs on loading screens and not in gameplay.
+ *
+ * Counted rather than a plain on/off because several owners overlap: boot, the
+ * intro movie, the engine's splash/loading screen, the streaming heuristic in
+ * the main loop, and the TXD preload. With a bare setter, whichever released
+ * first silently dropped the clock for everyone else -- which is exactly what
+ * was happening: the whole 604-dictionary preload ran at the normal clock
+ * because an earlier owner had already called cpu_boost(0).
+ *
+ * `who` is only for the log. Every acquire must be matched by exactly one
+ * release from the same owner. */
+void cpu_boost_acquire(const char *who);
+void cpu_boost_release(const char *who);
 
 static inline uint64_t io_tick_now(void) { return armGetSystemTick(); }
 static inline double io_tick_to_ms(uint64_t delta_ticks) {

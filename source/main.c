@@ -603,7 +603,12 @@ int main(void) {
   install_crash_handlers();
   debugPrintf("[MAIN] Starting GTA III Nintendo Switch Port (gta3_nx v1.2-stalledit " __DATE__ " " __TIME__ ")...\n");
 
-  cpu_boost(1);
+  /* Held from here until gameplay actually begins -- see the release at the
+   * gameplay transition below. Everything before that point is loading of one
+   * kind or another (boot, intro movie, frontend, the engine's world load, our
+   * preload), none of it presenting a frame that a throttled GPU would spoil,
+   * so there is no reason to hand the clock back in between. */
+  cpu_boost_acquire("pre_gameplay");
 
   setenv("MESA_GLTHREAD", "true", 1);
   setenv("GALLIUM_THREAD", "0", 1);
@@ -709,6 +714,7 @@ int main(void) {
   const u64 frame_ticks = tick_freq / (config.fps_cap_30 ? 30 : 60);
   u64 next_frame_tick = last_tick + frame_ticks;
   int boot_frames = 0;
+  static int s_pre_gameplay_boost_released = 0;
 
   g_main_thread_handle = envGetMainThreadHandle();
   pthread_t watchdog;
@@ -718,9 +724,6 @@ int main(void) {
 
   debugPrintf("[MAIN] Entering main frame execution loop...\n");
 
-  static int s_heavy_frames = 0;
-  static u64 s_boost_turn_off_tick = 0;
-  static int s_boost_active = 0;
 
   while (appletMainLoop() && !jni_quit_requested) {
     g_frame_count++;
@@ -744,43 +747,27 @@ int main(void) {
       LOGC(LOGC_SYS, "[PERF_SPIKE] Long frame detected: dt=%.4f s (%.1f FPS)\n", real_dt, 1.0f / real_dt);
     }
 
-    // Proactive CPU Boost Evaluation before entering frame work
-    if (boot_frames >= 10) {
-      /* A movie counts as work worth the clock for the same reason streaming
-       * does: software H.264 has a hard real-time deadline, and missing it is
-       * visible as a stuttering intro. */
-      bool movie_running = movie_is_playing();
-      bool active_streaming = movie_running ||
-                              (sc_debug_active_slots() > 0) || streaming_activity_recent(250.0);
-      if (active_streaming) {
-        if (!s_boost_active) {
-          cpu_boost(1);
-          s_boost_active = 1;
-          LOGC(LOGC_SYS, "[CPU_BOOST] ON reason=%s (frame #%u)\n",
-               movie_running ? "intro_movie" : "world_stream", g_frame_count);
-        }
-        s_heavy_frames = 0;
-        s_boost_turn_off_tick = armGetSystemTick() + (u64)(tick_freq * 1.5f); // Keep boost active for 1.5s quiet
-      } else if (real_dt > 0.040f) {
-        s_heavy_frames++;
-        if (s_heavy_frames >= 2 && !s_boost_active) {
-          cpu_boost(1);
-          s_boost_active = 1;
-          LOGC(LOGC_SYS, "[CPU_BOOST] ON reason=heavy_frames (frame #%u, dt=%.4fs)\n", g_frame_count, real_dt);
-        }
-        if (s_boost_active)
-          s_boost_turn_off_tick = armGetSystemTick() + (u64)(tick_freq * 1.5f); // Keep boost active for 1.5s quiet
-      } else {
-        s_heavy_frames = 0;
-        if (s_boost_active && s_boost_turn_off_tick > 0 &&
-            armGetSystemTick() >= s_boost_turn_off_tick) {
-          cpu_boost(0);
-          s_boost_active = 0;
-          s_boost_turn_off_tick = 0;
-          LOGC(LOGC_SYS, "[CPU_BOOST] OFF reason=quiet (frame #%u)\n", g_frame_count);
-        }
-      }
-    }
+    /* No CPU boost during gameplay -- deliberately.
+     *
+     * There used to be a heuristic here that raised the clock whenever
+     * streaming was active or two frames ran over 40ms. It looked harmless
+     * because it almost never fired: cpu_boost was a bare on/off setter, and
+     * movie_stop()'s cpu_boost(0) at the end of the intro left this code's
+     * s_boost_active stuck at 1, so it never re-armed. The bug was protecting
+     * us from the heuristic.
+     *
+     * Once the boost became reference-counted the heuristic started working,
+     * and it is actively harmful. ApmCpuBoostMode_FastLoad is documented as
+     * "Boost CPU. Additionally, throttle GPU to minimum." Gameplay needs the
+     * GPU. Worse, it self-reinforces: the throttled GPU makes frames exceed
+     * 40ms, heavy frames re-extend the boost, and the boost keeps the GPU
+     * throttled. Measured on the first run after the refcount landed -- the
+     * reference was taken at frame ~11 and never released for the entire
+     * session, with spike frames reporting 24-35 fps.
+     *
+     * FastLoad belongs where nothing is being rendered: boot, the intro movie,
+     * the engine's splash/loading screen, and the TXD preload. Those four own
+     * their own references. */
 
     g_active_phase = "implOnDrawFrame";
     reset_frame_streaming_budget();
@@ -828,6 +815,14 @@ int main(void) {
 
     // Check if a gameplay transition was observed by CPlayerPed::ProcessControl during this frame
     if (atomic_exchange_explicit(&g_gameplay_transition_pending, false, memory_order_acq_rel)) {
+      /* Gameplay is starting: hand the clock back. FastLoad throttles the GPU
+       * to minimum, so holding it past this point would trade a faster CPU for
+       * a crippled renderer -- measured once at 24-35 fps when a reference was
+       * accidentally never released. */
+      if (!s_pre_gameplay_boost_released) {
+        s_pre_gameplay_boost_released = 1;
+        cpu_boost_release("pre_gameplay");
+      }
       streaming_set_context(STREAM_GAMEPLAY);
       set_gameplay_streaming_enabled(true);
       set_stream_runtime_mode(STREAM_RUNTIME_TRANSITION, 60);
@@ -842,8 +837,7 @@ int main(void) {
        * leave the decoder running at the low clock -- which is exactly what
        * held the logo to ~14 of its 25 frames a second. movie_stop() lowers it
        * again when playback ends. */
-      if (++boot_frames == 10 && !movie_is_playing())
-        cpu_boost(0);
+      ++boot_frames;
     }
 
     if (config.fps_cap_30) {

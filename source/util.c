@@ -230,9 +230,43 @@ int debugPrintf(char *text, ...) {
 }
 
 // Boost CPU to 1785MHz during fast load operations
-void cpu_boost(int on) {
-  LOGC(LOGC_SYS, "[SYS] CPU boost %s\n", on ? "ENABLED (1785MHz)" : "DISABLED (Normal)");
+static int s_boost_refs = 0;
+
+/* Reports the configuration the system actually applied, rather than a clock
+ * speed we assumed. appletSetCpuBoostMode names a MODE; the system picks the
+ * clocks from its own table, and 0x92220009 (docked) / 0x9222000A (handheld)
+ * are what the libnx header says FastLoad maps to. Logging the real value is
+ * the only way to know the request took effect. */
+static void boost_apply(bool on) {
   appletSetCpuBoostMode(on ? ApmCpuBoostMode_FastLoad : ApmCpuBoostMode_Normal);
+  u32 cfg = 0;
+  Result rc = appletGetCurrentPerformanceConfiguration(&cfg);
+  if (R_SUCCEEDED(rc)) {
+    LOGC(LOGC_SYS, "[SYS] CPU boost %s -- PerformanceConfiguration=0x%08x\n",
+         on ? "FastLoad" : "Normal", cfg);
+  } else {
+    LOGC(LOGC_SYS, "[SYS] CPU boost %s -- could not read PerformanceConfiguration (rc=0x%x)\n",
+         on ? "FastLoad" : "Normal", rc);
+  }
+}
+
+void cpu_boost_acquire(const char *who) {
+  s_boost_refs++;
+  LOGC(LOGC_SYS, "[SYS] CPU boost acquire by '%s' (refs=%d)\n", who ? who : "?", s_boost_refs);
+  if (s_boost_refs == 1) boost_apply(true);
+}
+
+void cpu_boost_release(const char *who) {
+  if (s_boost_refs <= 0) {
+    /* Never let an unmatched release drive the count negative -- a stuck
+     * negative count would make every later acquire fail to raise the clock. */
+    LOGC(LOGC_SYS, "[SYS] CPU boost release by '%s' with no outstanding acquire -- ignored\n",
+         who ? who : "?");
+    return;
+  }
+  s_boost_refs--;
+  LOGC(LOGC_SYS, "[SYS] CPU boost release by '%s' (refs=%d)\n", who ? who : "?", s_boost_refs);
+  if (s_boost_refs == 0) boost_apply(false);
 }
 
 // Pin calling thread to a designated CPU core

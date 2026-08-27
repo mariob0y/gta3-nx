@@ -70,6 +70,8 @@ typedef struct {
 
 volatile int jni_quit_requested = 0;
 volatile int jni_frontend_ready = 0;
+/* Whether this file currently holds a CPU-boost reference for a loading screen. */
+static int jni_splash_boost_held = 0;
 
 // ---------------------------------------------------------------------------
 // deferred native-callback queue (the Java->native completion direction)
@@ -264,12 +266,31 @@ static void hal_void(const FakeID *id, va_list va) {
 
   // splash / loading screen: no Java UI, so these are no-ops. hideSplashScreen
   // is the engine's "loading finished" signal.
-  if (name_is(id, "showSplashScreen") || name_is(id, "setSplashImage") ||
-      name_is(id, "setSplashText")) {
+  /* NOTE: this build's engine never calls either of these -- a full session log
+   * contains zero occurrences of showSplashScreen or hideSplashScreen, and
+   * jni_frontend_ready is consequently never set from here. The loading-screen
+   * CPU boost therefore lives on CStreaming::LoadScene in game.c, which is the
+   * path this port actually takes.
+   *
+   * Kept rather than deleted because it is correct if the engine ever does call
+   * them, and because it costs nothing when it does not. The paired flag guards
+   * against unbalanced calls, so a stray hide cannot release a reference this
+   * never took. */
+  if (name_is(id, "showSplashScreen")) {
+    if (!jni_splash_boost_held) {
+      jni_splash_boost_held = 1;
+      cpu_boost_acquire("loading_screen");
+    }
+    return;
+  }
+  if (name_is(id, "setSplashImage") || name_is(id, "setSplashText")) {
     return;
   }
   if (name_is(id, "hideSplashScreen")) {
-    cpu_boost(0);
+    if (jni_splash_boost_held) {
+      jni_splash_boost_held = 0;
+      cpu_boost_release("loading_screen");
+    }
     jni_frontend_ready = 1;
     debugPrintf("JNI: hideSplashScreen -> frontend ready\n");
     return;

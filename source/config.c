@@ -25,6 +25,7 @@ Config config = {
   .show_fps_overlay = 0,
   .debug_log_enabled = 0,
   .intro_movies = 1,
+  .full_preload = 0,
 };
 
 int read_config(const char *file) {
@@ -47,6 +48,7 @@ int read_config(const char *file) {
       else if (strcmp(key, "show_fps_overlay") == 0) config.show_fps_overlay = atoi(val);
       else if (strcmp(key, "debug_log_enabled") == 0) config.debug_log_enabled = atoi(val);
       else if (strcmp(key, "intro_movies") == 0) config.intro_movies = atoi(val);
+      else if (strcmp(key, "full_preload") == 0) config.full_preload = atoi(val);
     }
   }
 
@@ -72,6 +74,8 @@ int write_config(const char *file) {
   fprintf(f, "streaming_budget_ms=%.1f\n", config.streaming_budget_ms);
   fprintf(f, "show_fps_overlay=%d\n", config.show_fps_overlay);
   fprintf(f, "debug_log_enabled=%d\n", config.debug_log_enabled);
+  fprintf(f, "intro_movies=%d\n", config.intro_movies);
+  fprintf(f, "full_preload=%d\n", config.full_preload);
 
   fclose(f);
   debugPrintf("[CONFIG] Successfully saved config to %s\n", file);
