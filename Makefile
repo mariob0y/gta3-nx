@@ -19,8 +19,8 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	gta3
 APP_TITLE	:=	Grand Theft Auto III
-APP_AUTHOR	:=	Switch Port
-APP_VERSION	:=	1.0.0
+APP_AUTHOR	:=	mariob0y
+APP_VERSION	:=	1.0.4
 BUILD		:=	build
 SOURCES		:=	source source/hooks
 DATA		:=	data
@@ -40,7 +40,7 @@ CFLAGS	+=	$(INCLUDE) -D__SWITCH__
 CXXFLAGS	:= $(CFLAGS)
 
 ASFLAGS	:=	-g $(ARCH)
-LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
+LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map) -Wl,--wrap=pthread_create
 
 # -lSDL2 is not used by our code, but devkitPro's libopenal.a is built with
 # an SDL2 audio backend and pulls in SDL_OpenAudioDevice et al.

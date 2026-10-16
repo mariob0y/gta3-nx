@@ -144,7 +144,9 @@ the performance overlay. Any face or shoulder button skips an intro movie.
 | `streaming_budget_ms` | `5.0` | per-frame time budget for streaming work |
 | `show_fps_overlay` | `0` | on-screen FPS / frame-time / freeze counter, plus resolution and dock state (top-left) |
 | `intro_movies` | `1` | play the Rockstar logo and title movies at boot; `0` skips straight to the menu |
-| `full_preload` | `0` | `1` = instantiate every texture dictionary before gameplay (longer load time, less stutter); `0` = stream normally |
+| `full_preload` | `1` | `1` = instantiate every texture dictionary before gameplay and after every save load (longer loading screens, much less stutter); `0` = stream normally |
+| `cpu_clock_mhz` | `1785` | CPU clock held during gameplay (the GPU is left alone); `0` keeps the system default of 1020. Higher draws more battery |
+| `gl_thread` | `1` | run the GL driver on its own core (Mesa's glthread); `0` turns it off. Needs a build linked against the patched Mesa — see [Building](#building-from-source) |
 | `debug_log_enabled` | `0` | write `gta3_log.txt` to the SD card |
 | `log_mask` | `0x...` | bitmask of log categories, only meaningful with logging on |
 
@@ -152,6 +154,18 @@ Set `show_fps_overlay=1` and `debug_log_enabled=1` if you are filing a performan
 Both are off by default because writing to the SD card every frame costs frames. The
 overlay can also be summoned mid-game with **L + R + D-pad Down**, which does not need a
 config edit or a relaunch (it is not remembered between launches).
+
+---
+
+## Performance
+
+For the smoothest 60 FPS, set `fps_cap_30=0` and leave everything else at its default
+(`full_preload`, `cpu_clock_mhz` and `gl_thread` are all on).
+
+> [!TIP]
+> **Already overclocking with sys-clk?** The port never lowers a clock that's already
+> higher than `cpu_clock_mhz`. If your sys-clk profile for this title sets a *lower* CPU
+> clock, set `cpu_clock_mhz=0`, or the two will keep overriding each other.
 
 ---
 
@@ -180,9 +194,38 @@ That produces `gta3.nro` in the project root. Copy it to `sdmc:/switch/gta3/`.
 > confusing, misleading ways.
 
 `libSDL2` is linked but unused by this code — devkitPro's `libopenal.a` is built against
-an SDL2 audio backend and pulls it in. To build against a newer Mesa than the portlib,
-drop an install tree at `mesa-install/opt/devkitpro/portlibs/switch/` and the Makefile
-picks it up automatically.
+an SDL2 audio backend and pulls it in.
+
+### Patched Mesa (for `gl_thread`)
+
+devkitPro's `switch-mesa` (20.1.0-rc3) compiles glthread out, and its Switch EGL driver
+never starts it. Release builds link a copy of that same Mesa version with a small patch
+on top. The patch lets the EGL driver start glthread when the environment asks
+(`mesa_glthread=true`, which the port sets from `gl_thread`). It also pins the worker
+to a core (`mesa_glthread_core`), gives Mesa's threads a 1 MiB stack, and exports
+`mesa_switch_glthread_active` so the port can log whether glthread actually started.
+
+The patches are in `patches/mesa/`. `scripts/build_mesa.py` follows devkitPro's own
+`switch-mesa` recipe, pinned to the same Mesa commit, with those patches added on top. It
+installs the result to `mesa-install/opt/devkitpro/portlibs/switch/`, and the Makefile
+links that instead of the portlib (run `make clean` once after it appears). It needs a
+Linux shell with devkitPro installed — WSL or the `devkitpro/devkita64` container — because
+Mesa generates part of its source with Python:
+
+```bash
+sudo dkp-pacman -S --needed switch-dev switch-libdrm_nouveau switch-zlib \
+    dkp-meson-scripts switch-pkg-config dkp-toolchain-vars
+sudo apt install bison flex ninja-build python3-pip && pip install mako meson
+python3 scripts/build_mesa.py
+```
+
+The script checks the built archives for the glthread symbols and fails loudly if the patch
+did not apply. Without it the build still works: it links the
+stock Mesa, `gl_thread` does nothing, and the log says
+`[EGL] glthread: unavailable`. `mesa-install/` is gitignored.
+
+The link also uses `-Wl,--wrap=pthread_create`. That's how the port places every thread
+on a core: Mesa's, OpenAL's, SDL's, FFmpeg's and its own.
 
 ---
 

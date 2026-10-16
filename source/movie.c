@@ -220,6 +220,7 @@ static bool mv_audio_open(Movie *m) {
    * it back well before the engine opens its own. */
   m->al_ctx = alcGetCurrentContext();
   if (!m->al_ctx) {
+    int cls = thread_class_push(THREAD_CLASS_AUDIO);
     m->al_own_dev = alcOpenDevice(NULL);
     if (m->al_own_dev) {
       const ALCint attr[] = { ALC_FREQUENCY, MOVIE_AUDIO_RATE, 0 };
@@ -228,6 +229,7 @@ static bool mv_audio_open(Movie *m) {
         m->al_ctx = m->al_own_ctx;
       }
     }
+    thread_class_pop(cls);
   }
   if (!m->al_ctx) {
     debugPrintf("[MOVIE] no OpenAL context available -- playing silent\n");

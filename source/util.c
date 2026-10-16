@@ -76,6 +76,10 @@ static void initNxLink(void) {
     socketExit();
 }
 
+bool nxlink_active(void) {
+  return s_nxlinkSock >= 0;
+}
+
 static void deinitNxLink(void) {
   if (s_nxlinkSock >= 0) {
     close(s_nxlinkSock);
@@ -106,6 +110,7 @@ void userAppExit(void) {
 
 void userAppInit(void) {}
 void userAppExit(void) {}
+bool nxlink_active(void) { return false; }
 
 #endif
 
@@ -269,6 +274,167 @@ void cpu_boost_release(const char *who) {
   if (s_boost_refs == 0) boost_apply(false);
 }
 
+/* ---- gameplay CPU clock ----------------------------------------------------
+ *
+ * Measured on hardware: in busy areas the main thread needs 20-23ms a frame at
+ * the default 1020 MHz while the swap stays short, so the frame is CPU-bound,
+ * not GPU-bound. The applet boost cannot help there (FastLoad throttles the GPU
+ * to minimum), but clkrst/pcv set the CPU rate on its own -- the same call
+ * sys-clk and RetroArch make.
+ *
+ * Re-asserted periodically rather than set once: releasing a FastLoad
+ * reference, docking and resuming from the HOME menu all make the system put
+ * its own rate back. Never applied while a FastLoad reference is held, so the
+ * two mechanisms do not fight. */
+#define CPU_CLOCK_MAX_MHZ 1785
+
+static int s_clk_state = 0;  /* 0 = not tried, 1 = ready, -1 = unavailable */
+static bool s_clk_use_clkrst = false;
+static ClkrstSession s_clk_session;
+static u32 s_clk_original_hz = 0;
+static u32 s_clk_applied_hz = 0;
+
+static Result clk_get(u32 *hz) {
+  return s_clk_use_clkrst ? clkrstGetClockRate(&s_clk_session, hz) : pcvGetClockRate(PcvModule_CpuBus, hz);
+}
+
+static Result clk_set(u32 hz) {
+  return s_clk_use_clkrst ? clkrstSetClockRate(&s_clk_session, hz) : pcvSetClockRate(PcvModule_CpuBus, hz);
+}
+
+static bool clk_init(void) {
+  if (s_clk_state != 0) return s_clk_state > 0;
+  Result rc;
+  s_clk_use_clkrst = hosversionAtLeast(8, 0, 0);
+  if (s_clk_use_clkrst) {
+    rc = clkrstInitialize();
+    if (R_SUCCEEDED(rc)) {
+      rc = clkrstOpenSession(&s_clk_session, PcvModuleId_CpuBus, 3);
+      if (R_FAILED(rc)) clkrstExit();
+    }
+  } else {
+    rc = pcvInitialize();
+  }
+  if (R_SUCCEEDED(rc)) rc = clk_get(&s_clk_original_hz);
+  if (R_FAILED(rc)) {
+    s_clk_state = -1;
+    LOGC(LOGC_SYS, "[CLOCK] CPU clock control unavailable (rc=0x%x) -- gameplay stays at the system rate\n", rc);
+    return false;
+  }
+  s_clk_state = 1;
+  LOGC(LOGC_SYS, "[CLOCK] CPU clock control ready via %s, system rate %u MHz\n",
+       s_clk_use_clkrst ? "clkrst" : "pcv", s_clk_original_hz / 1000000);
+  return true;
+}
+
+void gameplay_clock_maintain(void) {
+  int mhz = config.cpu_clock_mhz;
+  if (mhz <= 0 || s_boost_refs > 0) return;
+  if (mhz > CPU_CLOCK_MAX_MHZ) mhz = CPU_CLOCK_MAX_MHZ;
+  if (!clk_init()) return;
+
+  const u32 want = (u32)mhz * 1000000u;
+  u32 cur = 0;
+  if (R_FAILED(clk_get(&cur)) || cur >= want) return;
+  Result rc = clk_set(want);
+  u32 now = 0;
+  clk_get(&now);
+  if (now != s_clk_applied_hz) {
+    s_clk_applied_hz = now;
+    LOGC(LOGC_SYS, "[CLOCK] CPU %u -> %u MHz (asked %d, rc=0x%x, frame #%u)\n",
+         cur / 1000000, now / 1000000, mhz, rc, g_frame_count);
+  }
+}
+
+void gameplay_clock_restore(void) {
+  if (s_clk_state <= 0) return;
+  if (s_clk_original_hz) clk_set(s_clk_original_hz);
+  if (s_clk_use_clkrst) {
+    clkrstCloseSession(&s_clk_session);
+    clkrstExit();
+  } else {
+    pcvExit();
+  }
+  s_clk_state = 0;
+  debugPrintf("[CLOCK] CPU clock restored to %u MHz\n", s_clk_original_hz / 1000000);
+}
+
+/* ---- thread placement ------------------------------------------------------
+ *
+ * libnx's pthread_create (__syscall_thread_create) creates every thread at
+ * priority 0x3B on core -2, the process default core -- core 0, the main
+ * thread's core, at a LOWER priority than the main thread's 0x2C. Horizon never
+ * moves a thread off the core it was given. So Mesa's glthread worker, the
+ * OpenAL/SDL mixer and every helper thread were all queued behind the main
+ * thread on one core while cores 1 and 2 sat largely idle: glthread could only
+ * run while the main thread was blocked (draw calls measured at ~11us each on
+ * the main thread), and the audio mixer starved whenever a frame ran long
+ * (stuttering radio at the stock clock).
+ *
+ * Every pthread_create in the binary (Mesa, OpenAL, SDL, libstdc++, ours) is
+ * routed through __wrap_pthread_create (-Wl,--wrap=pthread_create), and the new
+ * thread places itself by the class that was active when it was created:
+ *   GL    -- created inside an EGL call            -> core 1
+ *   AUDIO -- created inside OpenAL device setup    -> core 2, priority 0x2C
+ *   other                                           -> cores 1-2, kernel's pick
+ * The main thread keeps core 0 to itself. Game threads still re-pin themselves
+ * afterwards through set_thread_core. */
+#define CORE_MASK_SECONDARY ((1ull << 1) | (1ull << 2))
+
+static volatile int s_thread_class = THREAD_CLASS_DEFAULT;
+
+int thread_class_push(int cls) {
+  int prev = s_thread_class;
+  s_thread_class = cls;
+  return prev;
+}
+
+void thread_class_pop(int prev) {
+  s_thread_class = prev;
+}
+
+typedef struct {
+  void *(*fn)(void *);
+  void *arg;
+  int cls;
+} PlacedThreadStart;
+
+int __real_pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(void *), void *arg);
+
+static void *placed_thread_entry(void *p) {
+  PlacedThreadStart s = *(PlacedThreadStart *)p;
+  free(p);
+
+  static const char *names[] = { "other", "GL", "AUDIO" };
+  int ideal = 2;
+  u64 mask = CORE_MASK_SECONDARY;
+  if (s.cls == THREAD_CLASS_GL) { ideal = 1; mask = 1ull << 1; }
+  else if (s.cls == THREAD_CLASS_AUDIO) { ideal = 2; mask = 1ull << 2; }
+  Result rc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, ideal, mask);
+  Result prc = 0;
+  if (s.cls == THREAD_CLASS_AUDIO)
+    prc = svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2C);
+
+  s32 prio = 0;
+  svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+  extern char __start__[];
+  LOGC(LOGC_THREAD, "[THREAD] %s thread fn=+0x%lx -> core mask 0x%lx (ideal %d, rc=0x%x), prio 0x%x (rc=0x%x), now on core %d\n",
+       names[s.cls], (unsigned long)((uintptr_t)s.fn - (uintptr_t)__start__), (unsigned long)mask, ideal, rc,
+       prio, prc, svcGetCurrentProcessorNumber());
+  return s.fn(s.arg);
+}
+
+int __wrap_pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(void *), void *arg) {
+  PlacedThreadStart *s = malloc(sizeof(*s));
+  if (!s) return __real_pthread_create(t, attr, fn, arg);
+  s->fn = fn;
+  s->arg = arg;
+  s->cls = s_thread_class;
+  int r = __real_pthread_create(t, attr, placed_thread_entry, s);
+  if (r != 0) free(s);
+  return r;
+}
+
 // Pin calling thread to a designated CPU core
 void set_thread_core(int core) {
   static u64 mask = 0;
@@ -376,10 +542,21 @@ void end_active_io(size_t bytes_read) {
   atomic_store_explicit(&g_active_io_blocking, false, memory_order_release);
 }
 
+/* The watchdog must be stopped and joined before __libnx_exit. hbloader unmaps
+ * the NRO as soon as main returns to it, so a thread still asleep in usleep
+ * wakes into unmapped code -- an Instruction Abort in hbloader on every exit
+ * that loses the race (crash report 01792157962: __thread_entry ->
+ * stall_watchdog_thread+0x38 -> usleep). */
+static volatile int s_watchdog_exit = 0;
+
+void stall_watchdog_request_stop(void) {
+  s_watchdog_exit = 1;
+}
+
 void *stall_watchdog_thread(void *arg) {
   (void)arg;
   int last_reported_interval = 0;
-  for (;;) {
+  while (!s_watchdog_exit) {
     usleep(STALL_POLL_US);
 
     uint64_t start = g_frame_start_tick;

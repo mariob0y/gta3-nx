@@ -1,0 +1,252 @@
+diff --git a/src/egl/drivers/switch/egl_switch.c b/src/egl/drivers/switch/egl_switch.c
+index af56ca6..d439027 100644
+--- a/src/egl/drivers/switch/egl_switch.c
++++ b/src/egl/drivers/switch/egl_switch.c
+@@ -48,6 +48,7 @@
+ #include "pipe/p_screen.h"
+ #include "pipe/p_state.h"
+ 
++#include "util/debug.h"
+ #include "util/u_atomic.h"
+ #include "util/u_box.h"
+ #include "util/u_debug.h"
+@@ -201,6 +202,42 @@ switch_st_framebuffer_flush_swapbuffers(struct st_context_iface *stctx, struct s
+     return true;
+ }
+ 
++//-----------------------------------------------------------------------------
++// glthread
++//-----------------------------------------------------------------------------
++
++// Set when the last context made here started glthread, so an application
++// linking this library can tell it is running with one (and, for instance,
++// stop mapping buffers, which glthread has to synchronise on).
++__attribute__((visibility("default"))) int mesa_switch_glthread_active = 0;
++
++// Called by glthread's worker as it starts (st_set_background_context). DRI
++// binds the EGL context to the worker here; nothing this driver does on the
++// worker's behalf - framebuffer validation, front-buffer flushes - consults
++// EGL's per-thread state, so there is nothing to bind.
++static void
++switch_st_set_background_context(struct st_context_iface *stctxi,
++                                 struct util_queue_monitoring *queue_info)
++{
++    (void)stctxi;
++    (void)queue_info;
++}
++
++// Wait until glthread's worker has executed everything queued on the
++// current context, before this thread touches the pipe context or a
++// resource the queued commands may still use. A no-op without glthread.
++// (dri_unbind_context, dri_flush and dri_set_tex_buffer2 do the same.)
++static void
++switch_finish_current(void)
++{
++    _EGLContext *ctx = _eglGetCurrentContext();
++    if (!ctx)
++        return;
++    struct switch_egl_context *context = switch_egl_context(ctx);
++    if (context->stctx && context->stctx->thread_finish)
++        context->stctx->thread_finish(context->stctx);
++}
++
+ //-----------------------------------------------------------------------------
+ // EGL driver methods
+ //-----------------------------------------------------------------------------
+@@ -351,8 +388,10 @@ switch_destroy_surface(_EGLDriver *drv, _EGLDisplay *disp, _EGLSurface *surf)
+     struct switch_egl_surface* surface = switch_egl_surface(surf);
+     CALLED();
+ 
+-    if (_eglPutSurface(surf))
++    if (_eglPutSurface(surf)) {
++        switch_finish_current();
+         switch_egl_surface_cleanup(surface);
++    }
+ 
+     return EGL_TRUE;
+ }
+@@ -490,6 +529,7 @@ switch_initialize(_EGLDriver *drv, _EGLDisplay *dpy)
+     }
+ 
+     stmgr->get_param = switch_st_get_param;
++    stmgr->set_background_context = switch_st_set_background_context;
+ 
+     // Create nouveau screen
+     TRACE("Creating nouveau screen\n");
+@@ -607,6 +647,17 @@ switch_create_context(_EGLDriver *drv, _EGLDisplay *dpy, _EGLConfig *conf,
+         goto cleanup;
+     }
+ 
++    // glthread: GL calls are recorded on the application's thread and
++    // executed by a worker (src/mesa/main/glthread.c), which on this platform
++    // pins itself to another core. Opt-in, as DRI's driconf option of the
++    // same name is: the application sets mesa_glthread=true in its
++    // environment before creating the context.
++    mesa_switch_glthread_active = 0;
++    if (context->stctx->start_thread && env_var_as_boolean("mesa_glthread", false)) {
++        context->stctx->start_thread(context->stctx);
++        mesa_switch_glthread_active = 1;
++    }
++
+     return &context->base;
+ 
+ cleanup:
+@@ -644,6 +695,9 @@ switch_make_current(_EGLDriver* drv, _EGLDisplay* dpy, _EGLSurface *dsurf,
+     _EGLContext *old_ctx;
+     _EGLSurface *old_dsurf, *old_rsurf;
+ 
++    // The outgoing context's queued commands run before it is unbound.
++    switch_finish_current();
++
+     if (!_eglBindContext(ctx, dsurf, rsurf, &old_ctx, &old_dsurf, &old_rsurf))
+         return EGL_FALSE;
+ 
+@@ -687,6 +741,11 @@ switch_swap_buffers(_EGLDriver *drv, _EGLDisplay *dpy, _EGLSurface *surf)
+         return EGL_TRUE;
+     }
+ 
++    // Everything the frame queued has to reach the pipe context before this
++    // thread flushes it and reads the back buffer's fence.
++    if (context->stctx->thread_finish)
++        context->stctx->thread_finish(context->stctx);
++
+     TRACE("Flushing context\n");
+     context->stctx->flush(context->stctx, ST_FLUSH_END_OF_FRAME, NULL, NULL, NULL);
+ 
+diff --git a/src/mesa/main/glthread.c b/src/mesa/main/glthread.c
+index b8e04c9..96a5c06 100644
+--- a/src/mesa/main/glthread.c
++++ b/src/mesa/main/glthread.c
+@@ -36,6 +36,7 @@
+ #include "main/glthread.h"
+ #include "main/glthread_marshal.h"
+ #include "main/hash.h"
++#include "util/debug.h"
+ #include "util/u_atomic.h"
+ #include "util/u_thread.h"
+ 
+@@ -63,11 +64,29 @@ glthread_unmarshal_batch(void *job, int thread_index)
+    batch->used = 0;
+ }
+ 
++#ifdef __SWITCH__
++/* From libnx (switch/kernel/svc.h). Declared rather than included: libnx's
++ * switch/types.h defines ALIGN and BIT, which main/macros.h defines too. */
++extern uint32_t svcSetThreadCoreMask(uint32_t handle, int32_t core_id, uint32_t affinity_mask);
++#define SWITCH_CUR_THREAD_HANDLE 0xFFFF8000u
++#endif
++
+ static void
+ glthread_thread_initialization(void *job, int thread_index)
+ {
+    struct gl_context *ctx = (struct gl_context*)job;
+ 
++#ifdef __SWITCH__
++   /* Horizon starts a new thread on its creator's core, at a lower priority
++    * than an application's main thread, so a worker left there only runs
++    * while the application waits and nothing is done in parallel. Moved to a
++    * core of its own: mesa_glthread_core, 1 unless set; 3 or more (the
++    * system's core) leaves it where it is. */
++   const unsigned core = env_var_as_unsigned("mesa_glthread_core", 1);
++   if (core < 3)
++      svcSetThreadCoreMask(SWITCH_CUR_THREAD_HANDLE, (int32_t)core, 1u << core);
++#endif
++
+    ctx->Driver.SetBackgroundContext(ctx, &ctx->GLThread.stats);
+    _glapi_set_context(ctx);
+ }
+diff --git a/src/mesa/state_tracker/st_context.c b/src/mesa/state_tracker/st_context.c
+index 848d075..b37b41d 100644
+--- a/src/mesa/state_tracker/st_context.c
++++ b/src/mesa/state_tracker/st_context.c
+@@ -1076,10 +1076,8 @@ st_destroy_context(struct st_context *st)
+     */
+    _mesa_make_current(ctx, NULL, NULL);
+ 
+-#ifndef __SWITCH__
+    /* This must be called first so that glthread has a chance to finish */
+    _mesa_glthread_destroy(ctx);
+-#endif
+ 
+    _mesa_HashWalk(ctx->Shared->TexObjects, destroy_tex_sampler_cb, st);
+ 
+diff --git a/src/mesa/state_tracker/st_manager.c b/src/mesa/state_tracker/st_manager.c
+index b96e793..46e0e32 100644
+--- a/src/mesa/state_tracker/st_manager.c
++++ b/src/mesa/state_tracker/st_manager.c
+@@ -994,10 +994,10 @@ st_api_create_context(struct st_api *stapi, struct st_manager *smapi,
+    st->iface.teximage = st_context_teximage;
+    st->iface.copy = st_context_copy;
+    st->iface.share = st_context_share;
+-#ifndef __SWITCH__
++   /* devkitPro's port compiled glthread out here, as unreachable: its EGL
++    * driver never started it. egl_switch.c can now, on request. */
+    st->iface.start_thread = st_start_thread;
+    st->iface.thread_finish = st_thread_finish;
+-#endif
+    st->iface.st_context_private = (void *) smapi;
+    st->iface.cso_context = st->cso_context;
+    st->iface.pipe = st->pipe;
+diff --git a/src/util/u_thread.h b/src/util/u_thread.h
+index 1f2a104..f038ce7 100644
+--- a/src/util/u_thread.h
++++ b/src/util/u_thread.h
+@@ -44,6 +44,31 @@
+ #include <OS.h>
+ #endif
+ 
++#ifdef __SWITCH__
++#include <pthread.h>
++#include <stdlib.h>
++
++/* thrd_create gives a thread libnx's default stack of 128 KiB. A Mesa worker
++ * - glthread's - runs the GLSL compiler and the nouveau back end, which
++ * compile shader variants at draw time too, and those want far more. So on
++ * this platform a Mesa thread is a pthread with a 1 MiB stack. (thrd_t is a
++ * pthread_t in devkitPro's newlib, so thrd_join and the rest still apply.) */
++#define U_THREAD_SWITCH_STACK_SIZE (1024 * 1024)
++
++struct u_thread_switch_start {
++   int (*routine)(void *);
++   void *param;
++};
++
++static inline void *
++u_thread_switch_entry(void *arg)
++{
++   struct u_thread_switch_start start = *(struct u_thread_switch_start *)arg;
++   free(arg);
++   return (void *)(intptr_t)start.routine(start.param);
++}
++#endif
++
+ #ifdef __FreeBSD__
+ #define cpu_set_t cpuset_t
+ #endif
+@@ -51,7 +76,25 @@
+ static inline thrd_t u_thread_create(int (*routine)(void *), void *param)
+ {
+    thrd_t thread;
+-#ifdef HAVE_PTHREAD
++#if defined(__SWITCH__)
++   struct u_thread_switch_start *start =
++      (struct u_thread_switch_start *)malloc(sizeof(*start));
++   if (!start)
++      return 0;
++   start->routine = routine;
++   start->param = param;
++
++   pthread_attr_t attr;
++   pthread_attr_init(&attr);
++   pthread_attr_setstacksize(&attr, U_THREAD_SWITCH_STACK_SIZE);
++   int ret = pthread_create(&thread, &attr, u_thread_switch_entry, start);
++   pthread_attr_destroy(&attr);
++   if (ret) {
++      free(start);
++      return 0;
++   }
++   return thread;
++#elif defined(HAVE_PTHREAD)
+    sigset_t saved_set, new_set;
+    int ret;
+ 

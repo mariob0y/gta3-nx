@@ -1,0 +1,18 @@
+diff --git a/include/c11/threads.h b/include/c11/threads.h
+index b512521..109ade8 100644
+--- a/include/c11/threads.h
++++ b/include/c11/threads.h
+@@ -46,6 +46,13 @@
+ #ifndef HAVE_TIMESPEC_GET
+ #include <sys/time.h>
+ 
++/* Newer devkitA64 newlib declares timespec_get in <time.h> - included above,
++ * through <threads.h> - without libnx defining it, so meson's link test still
++ * finds none and this fallback is compiled, where its static definition then
++ * clashes with that declaration. Under a name of its own it does not; every
++ * use below this point takes the macro. */
++#define timespec_get mesa_switch_timespec_get
++
+ static inline int
+ timespec_get(struct timespec *ts, int base)
+ {

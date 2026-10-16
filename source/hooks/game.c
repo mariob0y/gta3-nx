@@ -214,6 +214,7 @@ void keep_game_frame_limiter_off(void) {
 
 #include "../libc_shim.h"
 #include "../stream_cache.h"
+#include "../profiler.h"
 
 static bool path_is_world_stream_archive(const char *path) {
   if (!path) return false;
@@ -814,6 +815,8 @@ void set_stream_runtime_mode(StreamingRuntimeMode mode, unsigned grace_frames) {
 void process_gradual_prewarm_queue(void);
 static void log_preload_feasibility_survey(void);
 static void run_one_time_txd_preload(void);
+static void txd_preload_rearm(void);
+static void run_one_time_shader_precompile(void);
 static void run_one_time_area_preload(void);
 static bool prewarm_seed_batch_drained(void);
 
@@ -934,6 +937,7 @@ static int g_phase_test_delay_ms = 0;
 #define DEFINE_MEMBER_PHASE_HOOK(name, symbol_str) \
   typedef void (*MemberFunc_##name)(void *this_ptr); \
   static MemberFunc_##name orig_##name = NULL; \
+  static int prof_slot_##name = -1; \
   static void phase_wrap_##name(void *this_ptr) { \
     const char *prev = g_active_phase; \
     g_active_phase = symbol_str; \
@@ -941,6 +945,7 @@ static int g_phase_test_delay_ms = 0;
     double io_wait_start = atomic_load_explicit(&g_phase_io_wait_ms, memory_order_relaxed); \
     if (g_phase_test_delay_ms > 0) usleep(g_phase_test_delay_ms * 1000); \
     if (orig_##name) orig_##name(this_ptr); \
+    prof_add(prof_slot_##name, armTicksToNs(io_tick_now() - phase_t0)); \
     double total_ms = io_tick_to_ms(io_tick_now() - phase_t0); \
     double io_wait_end = atomic_load_explicit(&g_phase_io_wait_ms, memory_order_relaxed); \
     double nested_io_wait = io_wait_end - io_wait_start; \
@@ -959,6 +964,7 @@ DEFINE_MEMBER_PHASE_HOOK(CMenuManager_Process, "CMenuManager::Process")
 /* Dedicated wrapper for CStreaming::Update to manage live start tick */
 typedef void (*MemberFunc_CStreaming_Update)(void *this_ptr);
 static MemberFunc_CStreaming_Update orig_CStreaming_Update = NULL;
+static int prof_slot_CStreaming_Update = -1;
 
 static void phase_wrap_CStreaming_Update(void *this_ptr) {
   const char *prev = g_active_phase;
@@ -969,6 +975,7 @@ static void phase_wrap_CStreaming_Update(void *this_ptr) {
   atomic_store_explicit(&g_streaming_call_start_tick, phase_t0, memory_order_release);
 
   if (orig_CStreaming_Update) orig_CStreaming_Update(this_ptr);
+  prof_add(prof_slot_CStreaming_Update, armTicksToNs(io_tick_now() - phase_t0));
 
   atomic_store_explicit(&g_streaming_call_start_tick, 0, memory_order_release);
 
@@ -1847,7 +1854,60 @@ static void *wrap_RwTextureRasterGenerateMipmaps(void *raster, void *image) {
 typedef void (*Func_RemoveModel)(int modelIndex);
 static Func_RemoveModel orig_RemoveModel = NULL;
 
+/* Mobile streams the radar inside CRadar::DrawRadarMap (0x2265c0, decompiled):
+ * every frame it requests the 3x3 block of radar textures around the player
+ * and calls RemoveModel on every other one of the 64 (the call at 0x226730 is
+ * its only RemoveModel). CRadar::StreamRadarSections does the same but only
+ * runs from LoadScene; RemoveMapSection has no callers at all. Each section is a TXD that costs ~24 ms to
+ * instantiate, so crossing a section boundary while driving reloaded up to
+ * three of them: a ~70 ms hitch, the most common one left with full_preload
+ * on -- which loads all 64 and then watched the radar code throw 55 of them
+ * away on the first frame. They are tiny next to the ~2 GB streaming budget,
+ * so once loaded a radar section stays. Identified by the caller, so
+ * CRadar::RemoveRadarSections (shutdown, restart) still empties them. */
+#define RADAR_STREAMERS 3
+static uintptr_t s_radar_lo[RADAR_STREAMERS], s_radar_hi[RADAR_STREAMERS];
+static uint64_t s_radar_logged = 0; /* one bit per radar slot, for the log only */
+
+static bool removal_is_from_radar_streaming(uintptr_t ra) {
+  static int resolved = 0;
+  if (!resolved) {
+    static const char *syms[RADAR_STREAMERS] = {
+      "_ZN6CRadar12DrawRadarMapEv",
+      "_ZN6CRadar19StreamRadarSectionsEii",
+      "_ZN6CRadar19StreamRadarSectionsERK7CVector",
+    };
+    for (int i = 0; i < RADAR_STREAMERS; i++) {
+      s_radar_lo[i] = so_try_find_addr_rx(&game_mod, syms[i]);
+      s_radar_hi[i] = s_radar_lo[i] ? s_radar_lo[i] + so_symbol_size(&game_mod, syms[i]) : 0;
+    }
+    resolved = 1;
+  }
+  for (int i = 0; i < RADAR_STREAMERS; i++)
+    if (ra >= s_radar_lo[i] && ra < s_radar_hi[i]) return true;
+  return false;
+}
+
 static void wrap_RemoveModel(int modelIndex) {
+  if (removal_is_from_radar_streaming((uintptr_t)__builtin_return_address(0))) {
+    /* Asked for every out-of-range section every frame: log each once. */
+    unsigned bit = (unsigned)(modelIndex - STREAM_OFFSET_TXD) & 63;
+    if (streaming_get_model_load_state(modelIndex) != 0 && !(s_radar_logged & (1ull << bit))) {
+      s_radar_logged |= 1ull << bit;
+      LOGC(LOGC_SYS, "[RADAR] Keeping radar section %d resident\n", modelIndex);
+    }
+    return;
+  }
+
+  /* CRadar::StreamRadarSections asks to remove every out-of-range radar TXD
+   * every frame, loaded or not. Those calls are no-ops in the engine, but they
+   * were counted and logged as evictions: ~55 formatted lines a frame, 453k in
+   * one session. Only a resident model can actually be evicted. */
+  if (streaming_get_model_load_state(modelIndex) == 0) {
+    if (orig_RemoveModel) orig_RemoveModel(modelIndex);
+    return;
+  }
+
   bool is_pinned = (modelIndex >= 0 && modelIndex < 7000) && g_heavy_pinned_models[modelIndex];
 
   const char *prewarm_status_str = "NOT_TARGET";
@@ -2335,6 +2395,22 @@ static void wrap_ProcessLoadingChannel(int channel) {
 #error "STREAMING_MEMORY_BOOST_MB * 1024 * 1024 overflows a signed 32-bit int (ms_memoryAvailable's real type) above 2047"
 #endif
 typedef void (*Func_CStreaming_Init)(void);
+
+/* CGame::ShutDownForRestart -- the teardown half of loading a save or starting
+ * over from the menu (OS_ApplicationTick, then InitialiseWhenRestarting). It
+ * runs DeleteAllRwObjects + RemoveAllUnusedModels, which drop the preloaded
+ * dictionaries, and it never goes through CStreaming::Init: measured, a save
+ * loaded from the pause menu lost the whole preload without one, and ~40 TXD
+ * loads of 40-220 ms followed in gameplay. Re-arming here makes the preload
+ * run again on the next frame, after InitialiseWhenRestarting has rebuilt the
+ * world. */
+static Func_CStreaming_Init orig_CGame_ShutDownForRestart = NULL;
+
+static void wrap_CGame_ShutDownForRestart(void) {
+  LOGC(LOGC_SYS, "[STREAM_LIFECYCLE] CGame::ShutDownForRestart (frame=%u)\n", g_frame_count);
+  if (orig_CGame_ShutDownForRestart) orig_CGame_ShutDownForRestart();
+  txd_preload_rearm();
+}
 static Func_CStreaming_Init orig_CStreaming_Init = NULL;
 static Func_CStreaming_Init orig_CStreaming_ReInit = NULL;
 
@@ -2968,6 +3044,7 @@ void process_gradual_prewarm_queue(void) {
   // Runs before the grid: every TXD the grid's LoadScene calls would have
   // faulted in one at a time is already resident by the time it starts.
   run_one_time_txd_preload();      // no-ops after its first run
+  run_one_time_shader_precompile(); // likewise; independent of full_preload
   /* The grid belongs to the full_preload=0 path only. With every dictionary
    * preloaded it is pure cost: LoadScene purges the loaded list and calls
    * DeleteAllRwObjects before loading, so nine calls largely undo each other. */
@@ -2980,6 +3057,12 @@ static void wrap_CStreaming_Init(void) {
        g_frame_count, gameplay_streaming_enabled() ? 1 : 0, streaming_context_to_string(prev));
   if (orig_CStreaming_Init) orig_CStreaming_Init();
   LOGC(LOGC_SYS, "[STREAM_LIFECYCLE] CStreaming::Init ORIGINAL RETURN (frame=%u)\n", g_frame_count);
+  /* A second Init is the engine rebuilding the world: OS_ApplicationTick runs
+   * CGame::ShutDownForRestart + InitialiseWhenRestarting when a save is loaded
+   * or a new game started from the menu. That drops every dictionary, the
+   * preloaded ones included, and the preload only ever ran once -- measured:
+   * after loading a save, ~50 TXD loads of 50-150 ms each during gameplay. */
+  txd_preload_rearm();
   apply_streaming_memory_boost_runtime();
   request_all_seeds_immediately();
   pop_streaming_context(prev);
@@ -3450,6 +3533,19 @@ static uint64_t g_txd_covered_bytes = 0;
 static bool     g_txd_scan_done = false;
 static bool     g_txd_preload_complete = false;
 
+/* Lets run_one_time_txd_preload run again once the current one is done; a
+ * no-op before the first run (the boot Init) and with full_preload off. */
+static void txd_preload_rearm(void) {
+  if (!g_txd_preload_complete || !config.full_preload) return;
+  g_txd_preload_complete = false;
+  g_txd_scan_done = false;
+  g_txd_num_candidates = 0;
+  g_txd_cursor = 0;
+  g_txd_candidate_bytes = 0;
+  g_txd_covered_bytes = 0;
+  LOGC(LOGC_SYS, "[TXD_PRELOAD] World reloaded -- preload re-armed (frame #%u)\n", g_frame_count);
+}
+
 static void run_one_time_txd_preload(void) {
   if (g_txd_preload_complete) return;
   if (!config.full_preload) {
@@ -3647,6 +3743,88 @@ DEFINE_MEMBER_PHASE_HOOK(CGlass_Update, "CGlass::Update")
 DEFINE_MEMBER_PHASE_HOOK(CRopes_Update, "CRopes::Update")
 DEFINE_MEMBER_PHASE_HOOK(CCoronas_Update, "CCoronas::Update")
 
+/* ---------------------------------------------------------------------------
+ * Frame profile: which part of Idle() (0x1fea5c) the frame time goes to.
+ *
+ * Pure observation -- every wrapper calls straight through. All targets take at
+ * most one pointer argument (a `this`, an RwCamera*, or nothing), so one
+ * void *(void *) shape covers them: X0 is passed through and the return value
+ * handed back, which is a no-op for the void functions. Do not add a function
+ * with more arguments here without its own wrapper. */
+#define PROF_HOOK_TABLE(X) \
+  X(CCollision_Update,          "_ZN10CCollision6UpdateEv",                     "CCollision::Update", 1) \
+  X(CTheCarGenerators_Process,  "_ZN17CTheCarGenerators7ProcessEv",             "CTheCarGenerators::Process", 1) \
+  X(CPickups_Update,            "_ZN8CPickups6UpdateEv",                        "CPickups::Update", 1) \
+  X(CGarages_Update,            "_ZN8CGarages6UpdateEv",                        "CGarages::Update", 1) \
+  X(CCullZones_Update,          "_ZN10CCullZones6UpdateEv",                     "CCullZones::Update", 1) \
+  X(CTimeCycle_Update,          "_ZN10CTimeCycle6UpdateEv",                     "CTimeCycle::Update", 1) \
+  X(CShadows_UpdatePermanent,   "_ZN8CShadows22UpdatePermanentShadowsEv",       "CShadows::UpdatePermanentShadows", 1) \
+  X(cAudioManager_Service,      "_ZN13cAudioManager7ServiceEv",                 "cAudioManager::Service", 0) \
+  X(ConstructRenderList,        "_ZN9CRenderer19ConstructRenderListEv",         "CRenderer::ConstructRenderList", 0) \
+  X(PreRender,                  "_ZN9CRenderer9PreRenderEv",                    "CRenderer::PreRender", 0) \
+  X(RenderScene,                "_Z11RenderScenev",                             "RenderScene", 0) \
+  X(RenderEverythingBarRoads,   "_ZN9CRenderer24RenderEverythingBarRoadsEv",    "CRenderer::RenderEverythingBarRoads", 1) \
+  X(RenderRoads,                "_ZN9CRenderer11RenderRoadsEv",                 "CRenderer::RenderRoads", 1) \
+  X(RenderBoats,                "_ZN9CRenderer11RenderBoatsEv",                 "CRenderer::RenderBoats", 1) \
+  X(RenderFadingInEntities,     "_ZN9CRenderer22RenderFadingInEntitiesEv",      "CRenderer::RenderFadingInEntities", 1) \
+  X(RenderVehiclesButNotBoats,  "_ZN9CRenderer25RenderVehiclesButNotBoatsEv",   "CRenderer::RenderVehiclesButNotBoats", 1) \
+  X(RenderWater,                "_ZN11CWaterLevel11RenderWaterEv",              "CWaterLevel::RenderWater", 1) \
+  X(RenderEffects,              "_Z13RenderEffectsv",                           "RenderEffects", 0) \
+  X(CShadows_RenderStatic,      "_ZN8CShadows19RenderStaticShadowsEv",          "CShadows::RenderStaticShadows", 1) \
+  X(CShadows_RenderStored,      "_ZN8CShadows19RenderStoredShadowsEv",          "CShadows::RenderStoredShadows", 1) \
+  X(CCoronas_Render,            "_ZN8CCoronas6RenderEv",                        "CCoronas::Render", 1) \
+  X(CParticle_Render,           "_ZN9CParticle6RenderEv",                       "CParticle::Render", 1) \
+  X(CSkidmarks_Render,          "_ZN10CSkidmarks6RenderEv",                     "CSkidmarks::Render", 1) \
+  X(CGlass_Render,              "_ZN6CGlass6RenderEv",                          "CGlass::Render", 1) \
+  X(CPointLights_RenderFog,     "_ZN12CPointLights15RenderFogEffectEv",         "CPointLights::RenderFogEffect", 1) \
+  X(CWeaponEffects_Render,      "_ZN14CWeaponEffects6RenderEv",                 "CWeaponEffects::Render", 1) \
+  X(CMovingThings_Render,       "_ZN13CMovingThings6RenderEv",                  "CMovingThings::Render", 1) \
+  X(CCamera_RenderMotionBlur,   "_ZN7CCamera16RenderMotionBlurEv",              "CCamera::RenderMotionBlur", 0) \
+  X(Render2dStuff,              "_Z13Render2dStuffv",                           "Render2dStuff", 0) \
+  X(CHud_Draw,                  "_ZN4CHud4DrawEv",                              "CHud::Draw", 1) \
+  X(CFont_DrawFonts,            "_ZN5CFont9DrawFontsEv",                        "CFont::DrawFonts", 1) \
+  X(Touchscreen_Render,         "_ZN11Touchscreen6RenderEv",                    "Touchscreen::Render", 1)
+
+#define PROF_DEFINE(name, sym, label, depth) \
+  static void *(*orig_prof_##name)(void *) = NULL; \
+  static int prof_slot_p_##name = -1; \
+  static void *prof_wrap_##name(void *a0) { \
+    uint64_t t0 = armGetSystemTick(); \
+    void *r = orig_prof_##name(a0); \
+    prof_add(prof_slot_p_##name, armTicksToNs(armGetSystemTick() - t0)); \
+    return r; \
+  }
+PROF_HOOK_TABLE(PROF_DEFINE)
+PROF_DEFINE(CGame_Process, "_ZN5CGame7ProcessEv", "CGame::Process", 0)
+#undef PROF_DEFINE
+
+/* Installs one profile hook; the CGame::Process children that already have a
+ * phase hook are registered in between, so the report reads as a tree. */
+static void prof_install(const char *sym, const char *label, int depth, uintptr_t wrap, void **orig, int *slot) {
+  uintptr_t addr = so_try_find_addr_rx(&game_mod, sym);
+  if (!addr) {
+    LOGC(LOGC_SYS, "[PROFILE] %s not found -- not profiled\n", label);
+    return;
+  }
+  /* The trampoline overwrites the first 16 bytes. A shorter function -- the
+   * mobile build has several one-instruction tail calls and `ret` stubs --
+   * would have the start of whatever follows it overwritten. */
+  size_t size = so_symbol_size(&game_mod, sym);
+  if (size < 16) {
+    LOGC(LOGC_SYS, "[PROFILE] %s is only %zu bytes -- not profiled\n", label, size);
+    return;
+  }
+  *orig = (void *)hook_arm64_trampoline(addr, wrap);
+  if (!*orig) {
+    LOGC(LOGC_SYS, "[PROFILE] %s: prologue not relocatable -- not profiled\n", label);
+    return;
+  }
+  *slot = prof_register(label, depth);
+}
+
+#define PROF_INSTALL(name, sym, label, depth) \
+  prof_install(sym, label, depth, (uintptr_t)prof_wrap_##name, (void **)&orig_prof_##name, &prof_slot_p_##name);
+
 void setup_subsystem_phase_hooks(void) {
   LOGC(LOGC_SYS, "[PHASE_HOOK] Stage 0: Disassembling CGame::Process() (0x1fb700) BL targets...\n");
 
@@ -3721,12 +3899,16 @@ void setup_subsystem_phase_hooks(void) {
   LOGC(LOGC_SYS, "[PHASE_HOOK] Registering ABI-safe subsystem entry phase profiling hooks...\n");
   int installed_count = 0;
 
+  prof_install("_ZN5CGame7ProcessEv", "CGame::Process", 0, (uintptr_t)prof_wrap_CGame_Process,
+               (void **)&orig_prof_CGame_Process, &prof_slot_p_CGame_Process);
+
   #define INSTALL_PHASE_HOOK(name, symbol_mangled, human_str) do { \
     uintptr_t addr = so_try_find_addr_rx(&game_mod, symbol_mangled); \
     if (addr) { \
       orig_##name = (MemberFunc_##name)hook_arm64_trampoline(addr, (uintptr_t)phase_wrap_##name); \
       if (orig_##name) { \
         installed_count++; \
+        prof_slot_##name = prof_register(human_str, 1); \
         LOGC(LOGC_SYS, "[PHASE_HOOK] Subsystem '%s' hooked at %p (orig trampoline %p)\n", human_str, (void *)addr, (void *)orig_##name); \
       } else { \
         LOGC(LOGC_SYS, "[PHASE_HOOK] REJECTED hook for '%s' at %p (unrelocatable prologue)\n", human_str, (void *)addr); \
@@ -3759,6 +3941,9 @@ void setup_subsystem_phase_hooks(void) {
   INSTALL_PHASE_HOOK(CCoronas_Update, "_ZN8CCoronas6UpdateEv", "CCoronas::Update");
 
   #undef INSTALL_PHASE_HOOK
+
+  /* Everything else; CGame::Process went first, above. */
+  PROF_HOOK_TABLE(PROF_INSTALL)
 
   uintptr_t loadall_addr = so_try_find_addr_rx(&game_mod, "_ZN10CStreaming22LoadAllRequestedModelsEb");
   if (!loadall_addr) {
@@ -3972,6 +4157,15 @@ void setup_subsystem_phase_hooks(void) {
       installed_count++;
       LOGC(LOGC_SYS, "[STREAM_HOOK] CStreaming::ReInit hooked at %p (orig trampoline %p)\n",
            (void *)reinit_addr, (void *)orig_CStreaming_ReInit);
+    }
+  }
+
+  uintptr_t restart_addr = so_try_find_addr_rx(&game_mod, "_ZN5CGame18ShutDownForRestartEv");
+  if (restart_addr) {
+    orig_CGame_ShutDownForRestart = (Func_CStreaming_Init)hook_arm64_trampoline(restart_addr, (uintptr_t)wrap_CGame_ShutDownForRestart);
+    if (orig_CGame_ShutDownForRestart) {
+      installed_count++;
+      LOGC(LOGC_SYS, "[STREAM_HOOK] CGame::ShutDownForRestart hooked at %p\n", (void *)restart_addr);
     }
   }
 
@@ -4270,6 +4464,245 @@ static void patch_glyph_button_letters(void) {
   LOGC(LOGC_SYS, "[FRONTEND] Help icon letters remapped for the Switch face layout (X<->Y)\n");
 }
 
+/* ---------------------------------------------------------------------------
+ * Pause menu: keep its textures loaded between visits
+ *
+ * CMenuManager::Process (decompiled, 0x209ce4) calls LoadAllTextures every
+ * frame the menu is up and UnloadTextures every frame it is not; both return at
+ * once when there is nothing to do (the loaded flag at +0x467). So every time
+ * the pause menu opened, FRONTEND.TXD and MENU.TXD were read and instantiated
+ * and ~37 PNGs decoded and uploaded again: measured at ~820 ms per open.
+ *
+ * The close that comes from Process is refused while the textures are loaded,
+ * so the next open finds them still there. Every other caller -- quitting,
+ * ShutDownForRestart, starting a new game -- still unloads.
+ *
+ * LoadAllTextures does more than load, though, and returns before any of it
+ * when the flag is set. On the first open after a refused close we replay the
+ * non-texture part ourselves, in its order: menu music mode, the field at
+ * +2000, the radio-station preference, and the timer stop/update around the
+ * load. MakeSpaceFor / ImGonnaUse- / IHaveUsedStreamingMemory only account for
+ * the load itself and CFileMgr::SetDir("") only resets the path, so those are
+ * left out, as is LoadMenuIcons (the icons were never deleted).
+ * ------------------------------------------------------------------------- */
+#define MENU_OFF_SPRITES_LOADED 0x467
+
+typedef void (*Func_MenuTex)(void *self);
+typedef void (*Func_ChangeMusicMode)(void *dmaudio, uint8_t mode);
+typedef uint8_t (*Func_DMAudioByte)(void *dmaudio);
+typedef void (*Func_Void)(void);
+
+static Func_MenuTex orig_UnloadTextures = NULL;
+static Func_MenuTex orig_LoadAllTextures = NULL;
+static Func_ChangeMusicMode menu_ChangeMusicMode;
+static Func_DMAudioByte menu_GetRadioInCar;
+static Func_DMAudioByte menu_IsMP3RadioChannelAvailable;
+static Func_Void menu_TimerStop;
+static Func_Void menu_TimerUpdate;
+static void *menu_DMAudio;
+static int8_t *menu_PrefsRadioStation;
+static uintptr_t menu_process_lo, menu_process_hi;
+static bool g_menu_textures_kept = false;
+
+static void wrap_UnloadTextures(void *self) {
+  uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+  if (ra >= menu_process_lo && ra < menu_process_hi && ((uint8_t *)self)[MENU_OFF_SPRITES_LOADED]) {
+    if (!g_menu_textures_kept)
+      LOGC(LOGC_SYS, "[MENU] Pause menu closed -- keeping its textures loaded (frame #%u)\n", g_frame_count);
+    g_menu_textures_kept = true;
+    return;
+  }
+  g_menu_textures_kept = false;
+  orig_UnloadTextures(self);
+}
+
+static void wrap_LoadAllTextures(void *self) {
+  uint8_t *m = self;
+  if (!(m[MENU_OFF_SPRITES_LOADED] && g_menu_textures_kept)) {
+    orig_LoadAllTextures(self);
+    return;
+  }
+  g_menu_textures_kept = false;
+
+  menu_ChangeMusicMode(menu_DMAudio, 0);
+  *(int32_t *)(m + 2000) = 0;
+  *menu_PrefsRadioStation = (int8_t)menu_GetRadioInCar(menu_DMAudio);
+  const int8_t limit = menu_IsMP3RadioChannelAvailable(menu_DMAudio) ? 10 : 9;
+  if (*menu_PrefsRadioStation >= limit)
+    *menu_PrefsRadioStation = (int8_t)((rand() & 0xffff) % limit);
+  menu_TimerStop();
+  menu_TimerUpdate();
+  LOGC(LOGC_SYS, "[MENU] Pause menu opened with its textures already loaded (frame #%u)\n", g_frame_count);
+}
+
+static void install_menu_texture_cache(void) {
+  static const struct { const char *sym; void *slot; } deps[] = {
+    { "_ZN8cDMAudio15ChangeMusicModeEh", &menu_ChangeMusicMode },
+    { "_ZN8cDMAudio13GetRadioInCarEv", &menu_GetRadioInCar },
+    { "_ZN8cDMAudio26IsMP3RadioChannelAvailableEv", &menu_IsMP3RadioChannelAvailable },
+    { "_ZN6CTimer4StopEv", &menu_TimerStop },
+    { "_ZN6CTimer6UpdateEv", &menu_TimerUpdate },
+    { "DMAudio", &menu_DMAudio },
+    { "_ZN12CMenuManager19m_PrefsRadioStationE", &menu_PrefsRadioStation },
+  };
+  for (size_t i = 0; i < sizeof(deps) / sizeof(deps[0]); i++) {
+    uintptr_t a = so_try_find_addr_rx(&game_mod, deps[i].sym);
+    if (!a) {
+      LOGC(LOGC_SYS, "[MENU] %s not found -- menu textures unload as before\n", deps[i].sym);
+      return;
+    }
+    *(uintptr_t *)deps[i].slot = a;
+  }
+  menu_process_lo = so_try_find_addr_rx(&game_mod, "_ZN12CMenuManager7ProcessEv");
+  menu_process_hi = menu_process_lo + so_symbol_size(&game_mod, "_ZN12CMenuManager7ProcessEv");
+  uintptr_t unload = so_try_find_addr_rx(&game_mod, "_ZN12CMenuManager14UnloadTexturesEv");
+  uintptr_t load = so_try_find_addr_rx(&game_mod, "_ZN12CMenuManager15LoadAllTexturesEv");
+  if (!menu_process_lo || !unload || !load) return;
+
+  orig_LoadAllTextures = (Func_MenuTex)hook_arm64_trampoline(load, (uintptr_t)wrap_LoadAllTextures);
+  if (!orig_LoadAllTextures) return;
+  orig_UnloadTextures = (Func_MenuTex)hook_arm64_trampoline(unload, (uintptr_t)wrap_UnloadTextures);
+  LOGC(LOGC_SYS, "[MENU] Pause menu texture cache %s\n", orig_UnloadTextures ? "installed" : "NOT installed");
+}
+
+/* ---------------------------------------------------------------------------
+ * Shader variants: record them, and build last session's during loading
+ *
+ * The GL emulation layer (EmuShader, decompiled) builds one GLSL program per
+ * combination of render-state flags, the first time EmuShader::AssignShader
+ * meets that combination: EmuShader::EmuShader(flags) generates both sources
+ * from the flags alone, then compiles and links. That happens mid-frame, and
+ * Mesa's GLSL compiler on this hardware takes 50-200 ms per variant -- measured
+ * as the hitches of a session's first minutes (a watchdog sample landed in
+ * optimize_dead_builtin_variables). Nothing persists across boots: Mesa 20.1's
+ * nouveau has no disk shader cache.
+ *
+ * So every variant the engine creates is appended to SHADER_VARIANTS_FILE, and
+ * on the next boot they are all built during the loading screen, inserted into
+ * EmuShader::ShaderCloset exactly as AssignShader would (256 buckets keyed on
+ * flags & 0xff, linked through +0x18). Compile() binds the new program, so
+ * curAssignedShader is cleared afterwards: the engine's next AssignShader then
+ * looks its shader up and Selects it with a fresh glUseProgram.
+ * ------------------------------------------------------------------------- */
+#define SHADER_VARIANTS_FILE "shader_variants.txt"
+#define SHADER_VARIANTS_MAX 1024
+#define EMUSHADER_SIZE 0x68
+#define EMUSHADER_OFF_FLAGS 0x0c
+#define EMUSHADER_OFF_NEXT 0x18
+
+typedef void (*Func_EmuShaderCtor)(void *self, uint32_t flags);
+static Func_EmuShaderCtor orig_EmuShaderCtor = NULL;
+static Func_Void shader_InitializeShaderCloset;
+static uint8_t **shader_closet;           /* EmuShader::ShaderCloset, 256 heads */
+static uint8_t *shader_closet_ready;      /* ShaderClosetInitialized */
+static void **shader_cur_assigned;        /* curAssignedShader */
+static uint32_t s_known_variants[SHADER_VARIANTS_MAX];
+static int s_num_known_variants = 0;
+static bool s_variants_loaded = false;
+static bool s_precompiling = false;
+static bool s_precompile_ran = false; /* before it: boot and menu, not gameplay */
+
+static bool shader_variant_known(uint32_t flags) {
+  for (int i = 0; i < s_num_known_variants; i++)
+    if (s_known_variants[i] == flags) return true;
+  return false;
+}
+
+static void shader_variants_load(void) {
+  if (s_variants_loaded) return;
+  s_variants_loaded = true;
+  FILE *f = fopen(SHADER_VARIANTS_FILE, "r");
+  if (!f) return;
+  char line[32];
+  while (fgets(line, sizeof(line), f) && s_num_known_variants < SHADER_VARIANTS_MAX) {
+    uint32_t flags = (uint32_t)strtoul(line, NULL, 0);
+    if (!shader_variant_known(flags)) s_known_variants[s_num_known_variants++] = flags;
+  }
+  fclose(f);
+}
+
+static void wrap_EmuShaderCtor(void *self, uint32_t flags) {
+  uint64_t t0 = armGetSystemTick();
+  orig_EmuShaderCtor(self, flags);
+  if (s_precompiling) return;
+  double ms = (double)armTicksToNs(armGetSystemTick() - t0) / 1e6;
+
+  shader_variants_load();
+  bool known = shader_variant_known(flags);
+  LOGC(LOGC_SYS, "[SHADER] Built variant 0x%08x %s in %.1f ms%s (frame #%u)\n",
+       flags, s_precompile_ran ? "mid-game" : "before the pre-build", ms,
+       known ? " (already on file)" : " (new, recorded)", g_frame_count);
+  if (known || s_num_known_variants >= SHADER_VARIANTS_MAX) return;
+  s_known_variants[s_num_known_variants++] = flags;
+  FILE *f = fopen(SHADER_VARIANTS_FILE, "a");
+  if (f) {
+    fprintf(f, "0x%08x\n", flags);
+    fclose(f);
+  }
+}
+
+static bool shader_closet_has(uint32_t flags) {
+  for (uint8_t *s = shader_closet[flags & 0xff]; s; s = *(uint8_t **)(s + EMUSHADER_OFF_NEXT))
+    if (*(uint32_t *)(s + EMUSHADER_OFF_FLAGS) == flags) return true;
+  return false;
+}
+
+static void run_one_time_shader_precompile(void) {
+  static bool done = false;
+  if (done || !orig_EmuShaderCtor) return;
+  done = true;
+  s_precompile_ran = true;
+
+  shader_variants_load();
+  if (s_num_known_variants == 0) {
+    LOGC(LOGC_SYS, "[SHADER] No recorded variants yet -- this session records them (frame #%u)\n", g_frame_count);
+    return;
+  }
+  if (!*shader_closet_ready) shader_InitializeShaderCloset();
+
+  cpu_boost_acquire("shader_precompile");
+  uint64_t t0 = armGetSystemTick();
+  int built = 0;
+  s_precompiling = true;
+  for (int i = 0; i < s_num_known_variants; i++) {
+    uint32_t flags = s_known_variants[i];
+    if (shader_closet_has(flags)) continue;
+    uint8_t *s = malloc(EMUSHADER_SIZE);
+    if (!s) break;
+    orig_EmuShaderCtor(s, flags);
+    uint8_t **head = &shader_closet[flags & 0xff];
+    *(uint8_t **)(s + EMUSHADER_OFF_NEXT) = *head;
+    *head = s;
+    built++;
+  }
+  s_precompiling = false;
+  *shader_cur_assigned = NULL;
+  cpu_boost_release("shader_precompile");
+  LOGC(LOGC_SYS, "[SHADER] Pre-built %d of %d recorded variants in %.1f ms (frame #%u)\n",
+       built, s_num_known_variants, (double)armTicksToNs(armGetSystemTick() - t0) / 1e6, g_frame_count);
+}
+
+static void install_shader_variant_cache(void) {
+  static const struct { const char *sym; void *slot; } deps[] = {
+    { "_Z22InitializeShaderClosetv", &shader_InitializeShaderCloset },
+    { "_ZN9EmuShader12ShaderClosetE", &shader_closet },
+    { "ShaderClosetInitialized", &shader_closet_ready },
+    { "curAssignedShader", &shader_cur_assigned },
+  };
+  for (size_t i = 0; i < sizeof(deps) / sizeof(deps[0]); i++) {
+    uintptr_t a = so_try_find_addr_rx(&game_mod, deps[i].sym);
+    if (!a) {
+      LOGC(LOGC_SYS, "[SHADER] %s not found -- variants are built on demand as before\n", deps[i].sym);
+      return;
+    }
+    *(uintptr_t *)deps[i].slot = a;
+  }
+  uintptr_t ctor = so_try_find_addr_rx(&game_mod, "_ZN9EmuShaderC2Ej");
+  if (ctor)
+    orig_EmuShaderCtor = (Func_EmuShaderCtor)hook_arm64_trampoline(ctor, (uintptr_t)wrap_EmuShaderCtor);
+  LOGC(LOGC_SYS, "[SHADER] Variant cache %s\n", orig_EmuShaderCtor ? "installed" : "NOT installed");
+}
+
 void patch_game(void) {
   debugPrintf("[HOOKS] Applying GTA III game patches and symbol hooks...\n");
   apply_streaming_memory_boost_staging();
@@ -4472,6 +4905,8 @@ void patch_game(void) {
   frontend_remove_social_club_rows();
   frontend_skip_legal_pages();
   patch_glyph_button_letters();
+  install_menu_texture_cache();
+  install_shader_variant_cache();
 
   set_thread_core(0);
   LOGC(LOGC_SYS, "[HOOKS] Finished applying GTA III game patches.\n");

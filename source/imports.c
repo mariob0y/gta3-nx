@@ -53,6 +53,7 @@
 #include "util.h"
 #include "libc_shim.h"
 #include "overlay.h"
+#include "profiler.h"
 
 extern uintptr_t __cxa_atexit;
 
@@ -92,6 +93,48 @@ static void gl_state_cache_reset(void) {
   glc_ncaps = 0;
   memset(&glc, 0, sizeof(glc));
 }
+
+/* Main-thread time spent inside the hot GL entry points, per category, for the
+ * [PROFILE] report. With MESA_GLTHREAD these calls only marshal into a queue,
+ * so a category that costs real time here means the main thread is blocking
+ * on the GL thread (queue full or a sync), not doing GL work itself. */
+enum { PG_UNIFORM, PG_ATTRIB, PG_BINDBUF, PG_PROGRAM, PG_TEXTURE, PG_DRAW, PG_BUFDATA, PG_COUNT };
+static int s_pg[PG_COUNT];
+static int s_pg_ready = 0;
+
+static void pg_init(void) {
+  static const char *names[PG_COUNT] = {
+    "GL glUniform* (main thread)", "GL vertex attrib setup (main thread)",
+    "GL glBindBuffer (main thread)", "GL glUseProgram (main thread)",
+    "GL texture bind (main thread)", "GL draw calls (main thread)",
+    "GL glBufferData (main thread)",
+  };
+  for (int i = 0; i < PG_COUNT; i++) s_pg[i] = prof_register(names[i], 1);
+  s_pg_ready = 1;
+}
+
+#define PG_TIME(cat, call) do { \
+  if (!s_pg_ready) pg_init(); \
+  uint64_t _pg_t0 = armGetSystemTick(); \
+  call; \
+  prof_add(s_pg[cat], armTicksToNs(armGetSystemTick() - _pg_t0)); \
+} while (0)
+
+static void glUniform1f_p(GLint l, GLfloat v) { PG_TIME(PG_UNIFORM, glUniform1f(l, v)); }
+static void glUniform1fv_p(GLint l, GLsizei n, const GLfloat *v) { PG_TIME(PG_UNIFORM, glUniform1fv(l, n, v)); }
+static void glUniform1i_p(GLint l, GLint v) { PG_TIME(PG_UNIFORM, glUniform1i(l, v)); }
+static void glUniform2fv_p(GLint l, GLsizei n, const GLfloat *v) { PG_TIME(PG_UNIFORM, glUniform2fv(l, n, v)); }
+static void glUniform3fv_p(GLint l, GLsizei n, const GLfloat *v) { PG_TIME(PG_UNIFORM, glUniform3fv(l, n, v)); }
+static void glUniform4fv_p(GLint l, GLsizei n, const GLfloat *v) { PG_TIME(PG_UNIFORM, glUniform4fv(l, n, v)); }
+static void glUniformMatrix4fv_p(GLint l, GLsizei n, GLboolean t, const GLfloat *v) {
+  PG_TIME(PG_UNIFORM, glUniformMatrix4fv(l, n, t, v));
+}
+static void glVertexAttribPointer_p(GLuint i, GLint s, GLenum t, GLboolean n, GLsizei st, const void *p) {
+  PG_TIME(PG_ATTRIB, glVertexAttribPointer(i, s, t, n, st, p));
+}
+static void glEnableVertexAttribArray_p(GLuint i) { PG_TIME(PG_ATTRIB, glEnableVertexAttribArray(i)); }
+static void glDisableVertexAttribArray_p(GLuint i) { PG_TIME(PG_ATTRIB, glDisableVertexAttribArray(i)); }
+static void glBindBuffer_p(GLenum t, GLuint b) { PG_TIME(PG_BINDBUF, glBindBuffer(t, b)); }
 
 static void glEnable_c(GLenum cap) {
   if (glc_enabled) {
@@ -164,7 +207,7 @@ static void glBindTexture_c(GLenum target, GLuint tex) {
       glc.have_tex2d[idx] = 1; glc.tex2d[idx] = tex;
     }
   }
-  glBindTexture(target, tex);
+  PG_TIME(PG_TEXTURE, glBindTexture(target, tex));
 }
 static void glDeleteTextures_c(GLsizei n, const GLuint *t) {
   memset(glc.have_tex2d, 0, sizeof(glc.have_tex2d)); // a deleted bound tex must
@@ -196,7 +239,14 @@ static unsigned int eglSwapBuffers_cache(void *display, void *surface) {
 
   u64 t0 = armGetSystemTick();
   unsigned int r = eglSwapBuffersHook(display, surface);
-  double swap_ms = (double)armTicksToNs(armGetSystemTick() - t0) / 1e6;
+  const u64 swap_ns = armTicksToNs(armGetSystemTick() - t0);
+  /* The present: vsync wait plus whatever glthread still has queued. Timed
+   * here because the engine's own entry (RsCameraShowRaster) is a single
+   * tail-call instruction, too short to hook. */
+  static int prof_slot_swap = -2;
+  if (prof_slot_swap == -2) prof_slot_swap = prof_register("eglSwapBuffers (present + vsync)", 0);
+  prof_add(prof_slot_swap, swap_ns);
+  double swap_ms = (double)swap_ns / 1e6;
   if (swap_ms >= 5.0) {
     LOGC(LOGC_SYS, "[FRAME_SPLIT] SLOW SWAP: took %.2f ms\n", swap_ms);
   }
@@ -224,7 +274,9 @@ static EGLDisplay eglGetDisplay_wrap(EGLNativeDisplayType dpy) {
 static EGLBoolean eglInitialize_wrap(EGLDisplay dpy, EGLint *maj, EGLint *min) {
   LOGC(LOGC_EGL, "[EGL] eglInitialize(dpy=%p)...\n", dpy);
   EGLint a = 0, b = 0;
+  int cls = thread_class_push(THREAD_CLASS_GL); /* Mesa's screen threads */
   EGLBoolean res = eglInitialize(dpy, maj ? maj : &a, min ? min : &b);
+  thread_class_pop(cls);
   LOGC(LOGC_EGL, "[EGL] eglInitialize -> %d (maj=%d, min=%d)\n", res, maj ? *maj : a, min ? *min : b);
   return res;
 }
@@ -289,14 +341,31 @@ static EGLBoolean eglChooseConfig_wrap(EGLDisplay dpy, const EGLint *attribs, EG
   return res;
 }
 
+/* Defined by the patched switch-mesa (torchlight's patches/mesa): 1 while the
+ * last context it made runs glthread. Weak, so the stock library -- which has
+ * no such symbol -- still links and leaves its address null. */
+extern __attribute__((weak)) int mesa_switch_glthread_active;
+
+static void log_glthread_state(void) {
+  if (&mesa_switch_glthread_active == NULL)
+    LOGC(LOGC_SYS, "[EGL] glthread: unavailable (stock switch-mesa; mesa-install/ holds the patched one)\n");
+  else
+    LOGC(LOGC_SYS, "[EGL] glthread: %s (gl_thread=%d)\n",
+         mesa_switch_glthread_active ? "ON, worker on core 1" : "off", config.gl_thread);
+}
+
 static EGLContext eglCreateContext_wrap(EGLDisplay dpy, EGLConfig config, EGLContext share_context, const EGLint *attrib_list) {
   LOGC(LOGC_EGL, "[EGL] eglCreateContext(dpy=%p, config=%p, share=%p)...\n", dpy, config, share_context);
 
   EGLint up[64];
+  /* glthread's worker is created with the context. */
+  int cls = thread_class_push(THREAD_CLASS_GL);
   if (egl_attribs_with(attrib_list, EGL_CONTEXT_CLIENT_VER, 3, up, 64)) {
     EGLContext c3 = eglCreateContext(dpy, config, share_context, up);
     if (c3 != EGL_NO_CONTEXT) {
       g_gl_es3_context = 1;
+      thread_class_pop(cls);
+      log_glthread_state();
       LOGC(LOGC_SYS, "[EGL] Created a GLES3 context (was requesting GLES2)\n");
       return c3;
     }
@@ -304,6 +373,8 @@ static EGLContext eglCreateContext_wrap(EGLDisplay dpy, EGLConfig config, EGLCon
   }
 
   EGLContext res = eglCreateContext(dpy, config, share_context, attrib_list);
+  thread_class_pop(cls);
+  log_glthread_state();
   LOGC(LOGC_EGL, "[EGL] eglCreateContext -> %p\n", res);
   return res;
 }
@@ -328,7 +399,9 @@ static EGLBoolean eglMakeCurrent_dedup(EGLDisplay dpy, EGLSurface draw,
       g_mc[slot].read == read && g_mc[slot].ctx == ctx)
     return EGL_TRUE; // already current on this thread -> skip the redundant bind
 
+  int cls = thread_class_push(THREAD_CLASS_GL);
   EGLBoolean r = eglMakeCurrent(dpy, draw, read, ctx);
+  thread_class_pop(cls);
   LOGC(LOGC_EGL, "[EGL] eglMakeCurrent result = %d (error=0x%x)\n", r, eglGetError());
   if (r) {
     gl_state_cache_reset(); // context/surface changed -> GL state cache is stale
@@ -585,7 +658,16 @@ static void glCompressedTexImage2D_w(GLenum t, GLint l, GLenum i, GLsizei w,
 static void glBufferData_w(GLenum target, GLsizeiptr size, const void *data,
                            GLenum usage) {
   gl_load_drain();
-  glBufferData(target, size, data, usage);
+  PG_TIME(PG_BUFDATA, glBufferData(target, size, data, usage));
+}
+/* Counted for the [PROFILE] report: draw calls per frame. */
+static void glDrawArrays_w(GLenum mode, GLint first, GLsizei count) {
+  g_prof_draws++;
+  PG_TIME(PG_DRAW, glDrawArrays(mode, first, count));
+}
+static void glDrawElements_w(GLenum mode, GLsizei count, GLenum type, const void *indices) {
+  g_prof_draws++;
+  PG_TIME(PG_DRAW, glDrawElements(mode, count, type, indices));
 }
 
 FILE *stderr_fake = (FILE *)&fake_sF[2];
@@ -838,7 +920,7 @@ static void glLinkProgram_wrap(GLuint program) {
 
 static void glUseProgram_wrap(GLuint program) {
   LOGC(LOGC_GL, "[GL] glUseProgram(prog=%u)\n", program);
-  glUseProgram(program);
+  PG_TIME(PG_PROGRAM, glUseProgram(program));
 }
 
 void glTexParameteriHook(GLenum target, GLenum param, GLint val) {
@@ -1092,7 +1174,7 @@ DynLibFunction dynlib_functions[] = {
   { "glActiveTexture", (uintptr_t)&glActiveTexture_c },
   { "glAttachShader", (uintptr_t)&glAttachShader_wrap },
   { "glBindAttribLocation", (uintptr_t)&glBindAttribLocation },
-  { "glBindBuffer", (uintptr_t)&glBindBuffer },
+  { "glBindBuffer", (uintptr_t)&glBindBuffer_p },
   { "glBindFramebuffer", (uintptr_t)&glBindFramebuffer },
   { "glBindRenderbuffer", (uintptr_t)&glBindRenderbuffer },
   { "glBindTexture", (uintptr_t)&glBindTexture_c },
@@ -1117,11 +1199,11 @@ DynLibFunction dynlib_functions[] = {
   { "glDepthFunc", (uintptr_t)&glDepthFunc_c },
   { "glDepthMask", (uintptr_t)&glDepthMask_c },
   { "glDisable", (uintptr_t)&glDisable_c },
-  { "glDisableVertexAttribArray", (uintptr_t)&glDisableVertexAttribArray },
-  { "glDrawArrays", (uintptr_t)&glDrawArrays },
-  { "glDrawElements", (uintptr_t)&glDrawElements },
+  { "glDisableVertexAttribArray", (uintptr_t)&glDisableVertexAttribArray_p },
+  { "glDrawArrays", (uintptr_t)&glDrawArrays_w },
+  { "glDrawElements", (uintptr_t)&glDrawElements_w },
   { "glEnable", (uintptr_t)&glEnable_c },
-  { "glEnableVertexAttribArray", (uintptr_t)&glEnableVertexAttribArray },
+  { "glEnableVertexAttribArray", (uintptr_t)&glEnableVertexAttribArray_p },
   { "glFramebufferRenderbuffer", (uintptr_t)&glFramebufferRenderbuffer },
   { "glFramebufferTexture2D", (uintptr_t)&glFramebufferTexture2D },
   { "glFrontFace", (uintptr_t)&glFrontFace_c },
@@ -1146,15 +1228,15 @@ DynLibFunction dynlib_functions[] = {
   { "glShaderSource", (uintptr_t)&glShaderSource_wrap },
   { "glTexImage2D", (uintptr_t)&glTexImage2D_w },
   { "glTexParameteri", (uintptr_t)&glTexParameteri },
-  { "glUniform1f", (uintptr_t)&glUniform1f },
-  { "glUniform1fv", (uintptr_t)&glUniform1fv },
-  { "glUniform1i", (uintptr_t)&glUniform1i },
-  { "glUniform2fv", (uintptr_t)&glUniform2fv },
-  { "glUniform3fv", (uintptr_t)&glUniform3fv },
-  { "glUniform4fv", (uintptr_t)&glUniform4fv },
-  { "glUniformMatrix4fv", (uintptr_t)&glUniformMatrix4fv },
+  { "glUniform1f", (uintptr_t)&glUniform1f_p },
+  { "glUniform1fv", (uintptr_t)&glUniform1fv_p },
+  { "glUniform1i", (uintptr_t)&glUniform1i_p },
+  { "glUniform2fv", (uintptr_t)&glUniform2fv_p },
+  { "glUniform3fv", (uintptr_t)&glUniform3fv_p },
+  { "glUniform4fv", (uintptr_t)&glUniform4fv_p },
+  { "glUniformMatrix4fv", (uintptr_t)&glUniformMatrix4fv_p },
   { "glUseProgram", (uintptr_t)&glUseProgram_wrap },
-  { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer },
+  { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer_p },
   { "glViewport", (uintptr_t)&glViewport },
 
   { "setjmp", (uintptr_t)&setjmp },

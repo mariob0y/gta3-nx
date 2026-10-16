@@ -102,6 +102,7 @@ void set_active_io_path(const char *path);
 void begin_active_io(const char *path, size_t bytes);
 void end_active_io(size_t bytes_read);
 void *stall_watchdog_thread(void *arg);
+void stall_watchdog_request_stop(void);
 void emit_and_reset_frame_streaming_summary(double total_frame_ms);
 void print_crash_snapshot(int sig);
 
@@ -124,6 +125,20 @@ void print_crash_snapshot(int sig);
  * release from the same owner. */
 void cpu_boost_acquire(const char *who);
 void cpu_boost_release(const char *who);
+
+// Hold config.cpu_clock_mhz during gameplay (call periodically), and give the
+// system rate back at exit.
+void gameplay_clock_maintain(void);
+void gameplay_clock_restore(void);
+
+// True when stdout is redirected to nxlink, which owns its own socket session.
+bool nxlink_active(void);
+
+/* Class given to threads created until the matching pop; decides which core
+ * (and priority) the new thread places itself on -- see util.c. */
+enum { THREAD_CLASS_DEFAULT = 0, THREAD_CLASS_GL = 1, THREAD_CLASS_AUDIO = 2 };
+int thread_class_push(int cls);
+void thread_class_pop(int prev);
 
 static inline uint64_t io_tick_now(void) { return armGetSystemTick(); }
 static inline double io_tick_to_ms(uint64_t delta_ticks) {

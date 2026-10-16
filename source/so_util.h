@@ -52,6 +52,8 @@ typedef struct so_module {
 
 void hook_arm64(uintptr_t addr, uintptr_t dst);
 uintptr_t hook_arm64_trampoline(uintptr_t addr, uintptr_t dst);
+// st_size of a dynamic symbol, 0 if absent
+size_t so_symbol_size(so_module *mod, const char *symbol);
 
 void so_flush_caches(so_module *mod);
 void so_free_temp(so_module *mod);

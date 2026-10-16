@@ -8,3 +8,6 @@ lib/
 *.map
 *.lst
 *.py
+!scripts/*.py
+mesa-install/
+build-mesa/

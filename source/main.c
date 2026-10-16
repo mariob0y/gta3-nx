@@ -26,9 +26,14 @@
 #include "stream_cache.h"
 #include "movie.h"
 #include "overlay.h"
+#include "profiler.h"
 
 static void *heap_so_base = NULL;
 static size_t heap_so_limit = 0;
+/* The whole heap hbloader handed us (or we set), for the exit-time leak scan. */
+static uintptr_t s_heap_addr = 0;
+static size_t s_heap_size = 0;
+static Result s_sock_rc = -1;
 
 so_module donor_mod; // libc++_shared.so
 so_module game_mod;  // libGame.so
@@ -57,6 +62,9 @@ void __libnx_initheap(void) {
     if (R_FAILED(rc))
       diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_HeapAllocFailed));
   }
+
+  s_heap_addr = (uintptr_t)addr;
+  s_heap_size = size;
 
   extern char *fake_heap_start;
   extern char *fake_heap_end;
@@ -574,11 +582,84 @@ static void update_gamepad(void) {
   }
 }
 
+static pthread_t s_watchdog;
+static int s_watchdog_running = 0;
+
+/* Mesa opens nvdrv and hands it __nx_nv_transfermem_size (1.5 GB) of our heap
+ * as transfer memory; those pages stay locked until the nvdrv session closes,
+ * and only eglTerminate makes Mesa close it. hbloader runs the next NRO in this
+ * same process on this same heap, so skipping this left sphaira a heap with a
+ * locked block in it: it faulted in memset at the same offset (0x1822000) into
+ * a 64 MB allocation after every exit, even with the .so mappings released. */
+/* hbloader starts the next NRO in this process on this same heap, so any page
+ * we leave locked becomes a hole in that program's heap -- sphaira faulted in
+ * memset ~24 MB into a fresh 64 MB block after every exit, at a slightly
+ * different offset each time. Logs every heap region that is not plain RW heap
+ * by the time we hand back, which is exactly the set of such holes. */
+static void log_heap_leftovers(void) {
+  if (!s_heap_size) return;
+  uintptr_t addr = s_heap_addr, end = s_heap_addr + s_heap_size;
+  int found = 0;
+  while (addr < end) {
+    MemoryInfo mi;
+    u32 pi;
+    if (R_FAILED(svcQueryMemory(&mi, &pi, addr)) || mi.size == 0) break;
+    if (mi.type != MemType_Heap || mi.perm != Perm_Rw || mi.attr != 0) {
+      debugPrintf("[EXIT] Heap leftover: %p +0x%lx (%lu KB) type=0x%x perm=%u attr=0x%x ipc=%u dev=%u\n",
+                  (void *)mi.addr, (unsigned long)mi.size, (unsigned long)(mi.size >> 10),
+                  mi.type, mi.perm, mi.attr, mi.ipc_refcount, mi.device_refcount);
+      found++;
+    }
+    addr = mi.addr + mi.size;
+  }
+  debugPrintf("[EXIT] Heap scan: %d leftover region(s) in %p +0x%lx\n",
+              found, (void *)s_heap_addr, (unsigned long)s_heap_size);
+}
+
+static void shutdown_egl(void) {
+  EGLDisplay dpy = eglGetCurrentDisplay();
+  if (dpy == EGL_NO_DISPLAY)
+    dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+  if (dpy == EGL_NO_DISPLAY) {
+    debugPrintf("[EXIT] No EGL display to terminate\n");
+    return;
+  }
+  EGLContext ctx = eglGetCurrentContext();
+  EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
+  eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  if (surf != EGL_NO_SURFACE) eglDestroySurface(dpy, surf);
+  if (ctx != EGL_NO_CONTEXT) eglDestroyContext(dpy, ctx);
+  EGLBoolean ok = eglTerminate(dpy);
+  eglReleaseThread();
+  debugPrintf("[EXIT] EGL terminated (ok=%d, err=0x%x) -- GPU transfer memory released\n",
+              ok, eglGetError());
+}
+
 void hard_exit(void) {
   debugPrintf("[EXIT] Performing hard exit routine...\n");
+  if (s_watchdog_running) {
+    s_watchdog_running = 0;
+    stall_watchdog_request_stop();
+    pthread_join(s_watchdog, NULL); /* at most one 20ms poll */
+    debugPrintf("[EXIT] Stall watchdog stopped\n");
+  }
   debugPrintfFlush();
   thread_registry_pause_others();
   deinit_openal();
+  gameplay_clock_restore();
+  shutdown_egl();
+  /* Last, once nothing can run game code: give the heap pages behind the .so
+   * code mappings back. hbloader starts the next NRO in this same process. */
+  so_unload(&game_mod);
+  so_unload(&donor_mod);
+  /* bsd keeps a transfer-memory buffer carved from our heap until its session
+   * closes. nxlink owns the session when it is attached and closes it itself. */
+  if (R_SUCCEEDED(s_sock_rc) && !nxlink_active()) {
+    socketExit();
+    debugPrintf("[EXIT] Socket session closed\n");
+  }
+  log_heap_leftovers();
+  debugPrintfFlush();
   extern void NX_NORETURN __libnx_exit(int rc);
   __libnx_exit(0);
 }
@@ -610,7 +691,6 @@ int main(void) {
    * so there is no reason to hand the clock back in between. */
   cpu_boost_acquire("pre_gameplay");
 
-  setenv("MESA_GLTHREAD", "true", 1);
   setenv("GALLIUM_THREAD", "0", 1);
   setenv("NOUVEAU_SWITCH_MAPPED_COMPLETION", "1", 1);
 
@@ -626,12 +706,19 @@ int main(void) {
   read_config(CONFIG_NAME);
   write_config(CONFIG_NAME);
 
+  /* Read by the patched switch-mesa as the context is made (see config.h).
+   * Lowercase on purpose: Mesa's option is "mesa_glthread", and newlib's
+   * getenv is case-sensitive -- the MESA_GLTHREAD this used to set was never
+   * read by anything, and the stock portlib has no glthread to start anyway. */
+  setenv("mesa_glthread", config.gl_thread ? "true" : "false", 1);
+  setenv("mesa_glthread_core", "1", 1);
+
   check_syscalls();
   check_data();
 
-  Result sock_rc = socketInitializeDefault();
-  if (R_FAILED(sock_rc))
-    debugPrintf("[MAIN] socketInitializeDefault failed: 0x%08x (networking disabled)\n", sock_rc);
+  s_sock_rc = socketInitializeDefault();
+  if (R_FAILED(s_sock_rc))
+    debugPrintf("[MAIN] socketInitializeDefault failed: 0x%08x (networking disabled)\n", s_sock_rc);
 
   set_screen_size(config.screen_width, config.screen_height);
 
@@ -713,14 +800,25 @@ int main(void) {
   u64 last_tick = armGetSystemTick();
   const u64 frame_ticks = tick_freq / (config.fps_cap_30 ? 30 : 60);
   u64 next_frame_tick = last_tick + frame_ticks;
+  /* Uncapped (60 fps) mode is paced by vsync, not by us. The engine calls
+   * eglSwapInterval(1) in implOnSurfaceChanged (0x36ce74), so eglSwapBuffers
+   * already holds the loop to the display. Sleeping to exactly 1/60s on top of
+   * that made the loop slightly SLOWER than the display -- the sleep is timed
+   * from after input/JNI and always overshoots a little -- so every second or
+   * so a refresh had no new frame and repeated the last one: a 33ms hitch at
+   * any CPU clock, which is why overclocking never fixed it. The sleep stays
+   * only as a ceiling above 60, for iterations that never reach a swap (intro
+   * movie waits) and for a driver that ignores the swap interval. */
+  const u64 uncapped_ceiling_ticks = tick_freq / 70;
+  if (!config.fps_cap_30)
+    debugPrintf("[PACING] 60 fps mode: vsync paced, software ceiling 70 Hz\n");
   int boot_frames = 0;
   static int s_pre_gameplay_boost_released = 0;
 
   g_main_thread_handle = envGetMainThreadHandle();
-  pthread_t watchdog;
-  if (pthread_create(&watchdog, NULL, stall_watchdog_thread, NULL) == 0) {
-    pthread_detach(watchdog);
-  }
+  /* Joinable, not detached: hard_exit has to stop it before the NRO unmaps. */
+  if (pthread_create(&s_watchdog, NULL, stall_watchdog_thread, NULL) == 0)
+    s_watchdog_running = 1;
 
   debugPrintf("[MAIN] Entering main frame execution loop...\n");
 
@@ -767,7 +865,10 @@ int main(void) {
      *
      * FastLoad belongs where nothing is being rendered: boot, the intro movie,
      * the engine's splash/loading screen, and the TXD preload. Those four own
-     * their own references. */
+     * their own references.
+     *
+     * Gameplay gets its clock another way: gameplay_clock_maintain (below)
+     * raises the CPU alone through clkrst, leaving the GPU at its own rate. */
 
     g_active_phase = "implOnDrawFrame";
     reset_frame_streaming_budget();
@@ -806,7 +907,9 @@ int main(void) {
 
     g_active_phase = "FrameLimiter";
 
-    double frame_work_ms = (double)armTicksToNs(armGetSystemTick() - t_frame0) / 1e6;
+    const uint64_t frame_work_ns = armTicksToNs(armGetSystemTick() - t_frame0);
+    prof_end_frame(frame_work_ns);
+    double frame_work_ms = (double)frame_work_ns / 1e6;
     emit_and_reset_frame_streaming_summary(frame_work_ms);
     if (frame_work_ms >= 5.0) {
       LOGC(LOGC_SYS, "[FRAME_SPLIT] implOnDrawFrame took %.2f ms (frame #%u)\n", frame_work_ms, g_frame_count);
@@ -831,6 +934,11 @@ int main(void) {
       update_streaming_transition_frame();
     }
 
+    /* Once a second is enough: it only has to win back the rate after the
+     * system resets it (a FastLoad release, docking, HOME menu). */
+    if (s_pre_gameplay_boost_released && (g_frame_count % 60) == 0)
+      gameplay_clock_maintain();
+
     if (boot_frames < 10) {
       /* The intro movies start around frame 5, and movie_play() raises the
        * clock for them. Dropping it here would undo that a few frames later and
@@ -850,8 +958,8 @@ int main(void) {
       next_frame_tick += frame_ticks;
     } else {
       const u64 used = armGetSystemTick() - now;
-      if (used < frame_ticks)
-        svcSleepThread((frame_ticks - used) * 1000000000ULL / tick_freq);
+      if (used < uncapped_ceiling_ticks)
+        svcSleepThread((uncapped_ceiling_ticks - used) * 1000000000ULL / tick_freq);
     }
   }
 

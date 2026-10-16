@@ -497,6 +497,14 @@ uintptr_t so_try_find_addr_rx(so_module *mod, const char *symbol) {
   return 0;
 }
 
+size_t so_symbol_size(so_module *mod, const char *symbol) {
+  for (int i = 0; i < mod->num_syms; i++) {
+    if (strcmp(mod->dynstrtab + mod->syms[i].st_name, symbol) == 0)
+      return (size_t)mod->syms[i].st_size;
+  }
+  return 0;
+}
+
 DynLibFunction *so_find_import(DynLibFunction *funcs, int num_funcs, const char *name) {
   for (int i = 0; i < num_funcs; ++i)
     if (!strcmp(funcs[i].symbol, name))
@@ -514,16 +522,20 @@ int so_unload(so_module *mod) {
     so_free_temp(mod);
   }
 
-  for (int i = 0; i < mod->phnum; i++) {
-    const Elf64_Phdr *p = &mod->phdr[i];
-    if (p->p_type != PT_LOAD || !(p->p_flags & PF_X))
-      continue;
-    const u64 seg_start = ((u64)mod->load_virtbase + p->p_vaddr) & ~0xFFFull;
-    const u64 seg_end = ALIGN_MEM((u64)mod->load_virtbase + p->p_vaddr + p->p_memsz, 0x1000);
-    svcSetProcessMemoryPermission(envGetOwnProcessHandle(), seg_start, seg_end - seg_start, Perm_Rw);
-  }
+  /* The whole region, not just the PF_X segments: so_finalize also made the
+   * trampoline tail RX, and every page has to be back to RW before the alias
+   * can be torn down. */
+  Result rc = svcSetProcessMemoryPermission(envGetOwnProcessHandle(), (u64)mod->load_virtbase,
+                                            mod->load_size, Perm_Rw);
+  if (R_FAILED(rc))
+    debugPrintf("[LOADER] %s: reset to RW failed: 0x%08x\n", mod->name, rc);
 
-  svcUnmapProcessCodeMemory(envGetOwnProcessHandle(), (u64)mod->load_virtbase, (u64)mod->load_base, mod->load_size);
+  /* Until this runs, the heap pages behind load_base stay Perm_None. hbloader
+   * reuses this process for the next NRO, so skipping it leaves that program a
+   * heap with an untouchable hole in it -- sphaira faulted in memset 24MB into
+   * a fresh 64MB allocation after every GTA III exit. */
+  rc = svcUnmapProcessCodeMemory(envGetOwnProcessHandle(), (u64)mod->load_virtbase, (u64)mod->load_base, mod->load_size);
+  debugPrintf("[LOADER] %s: code memory unmapped (rc=0x%08x)\n", mod->name, rc);
 
   virtmemLock();
   virtmemRemoveReservation(mod->load_memrv);
